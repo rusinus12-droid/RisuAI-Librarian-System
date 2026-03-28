@@ -1,6 +1,6 @@
 # 📚 Librarian System - Long Memory AI Assistant
 
-[![Version](https://img.shields.io/badge/version-2.7.6-blue.svg)](https://github.com/rusinus12/RisuAI-Librarian-System
+[![Version](https://img.shields.io/badge/version-1.1.1-blue.svg)](https://github.com/rusinus12/RisuAI-Librarian-System
 )
 [![API](https://img.shields.io/badge/RisuAI%20API-3.0-green.svg)](https://risuai.xyz)
 [![License](https://img.shields.io/badge/license-MIT-orange.svg)](LICENSE)
