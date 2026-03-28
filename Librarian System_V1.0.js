@@ -950,20 +950,35 @@
                     try { argVal = await risuai.getArgument(argName); } catch (e) {}
                 }
 
-                let val = argVal;
-                if (val === undefined || val === null || val === '') {
-                    if (parent && local[parent] !== undefined) val = local[parent][key];
-                    else if (!parent && local[key] !== undefined) val = local[key];
+                // 1. 저장된 설정(local) 확인: 사용자가 GUI에서 저장한 값이 있다면 최우선
+                let localVal;
+                if (parent && local[parent] !== undefined) localVal = local[parent][key];
+                else if (!parent && local[key] !== undefined) localVal = local[key];
+
+                // localVal이 존재하면 (0 또는 false 포함) 이를 사용
+                if (localVal !== undefined && localVal !== null && localVal !== '') {
+                    if (type === 'number') {
+                        const num = Number(localVal);
+                        return isNaN(num) ? (parent ? cfg[parent][key] : cfg[key]) : num;
+                    }
+                    if (type === 'boolean') return (localVal === true || localVal === 'true' || localVal === 1 || localVal === '1');
+                    return String(localVal);
                 }
 
-                if (val !== undefined && val !== null && val !== '') {
-                    if (type === 'number') return Number(val);
-                    if (type === 'boolean') return (val === true || val === 'true' || val === 1 || val === '1');
-                    return String(val);
+                // 2. 인자(argVal) 확인: 저장된 설정이 없을 때만 사용
+                // 리스아이는 인자가 비어있으면 0 또는 ""을 반환하므로, 유의미한 값인지 체크
+                if (argVal !== undefined && argVal !== null && argVal !== '' && argVal !== 0 && argVal !== '0') {
+                    if (type === 'number') {
+                        const num = Number(argVal);
+                        if (!isNaN(num)) return num;
+                    }
+                    if (type === 'boolean') return (argVal === true || argVal === 'true' || argVal === 1 || argVal === '1');
+                    return String(argVal);
                 }
+
+                // 3. 기본값(cfg) 반환
                 return parent ? cfg[parent][key] : cfg[key];
             };
-
             cfg.maxLimit = await getVal('maxLimit', 'max_limit', 'number');
             cfg.threshold = await getVal('threshold', 'threshold', 'number');
             cfg.simThreshold = await getVal('simThreshold', 'sim_threshold', 'number') ?? 0.25;
@@ -1343,16 +1358,22 @@
             }
 
             // 프리셋 버튼 로직
-            const applyPreset = (limit, thresh, sim, sum, gc, event) => {
+            const applyPreset = async (limit, thresh, sim, sum, gc, event) => {
                 if(overlay.querySelector('#cfg-maxLimit')) overlay.querySelector('#cfg-maxLimit').value = limit;
                 if(overlay.querySelector('#cfg-threshold')) overlay.querySelector('#cfg-threshold').value = thresh;
                 if(overlay.querySelector('#cfg-simThreshold')) overlay.querySelector('#cfg-simThreshold').value = sim;
                 if(overlay.querySelector('#cfg-summaryThreshold')) overlay.querySelector('#cfg-summaryThreshold').value = sum;
                 if(overlay.querySelector('#cfg-gcFrequency')) overlay.querySelector('#cfg-gcFrequency').value = gc;
-                
+
+                // 자동 저장 추가
+                const saveBtn = overlay.querySelector('#lmai-save-cfg');
+                if (saveBtn) {
+                    saveBtn.click();
+                }
+
                 const btn = event.target;
                 const originalText = btn.innerText;
-                btn.innerText = "✅ 적용됨";
+                btn.innerText = "✅ 저장됨";
                 btn.style.background = "#4a9eff";
                 setTimeout(() => {
                     btn.innerText = originalText;
@@ -1399,9 +1420,40 @@
             embedFormat.onchange = () => updateModelList(embedFormat.value);
             updateModelList(MemoryEngine.CONFIG.mainModel.format);
 
-            // Save configuration
+            // 알림 표시 유틸리티
+            const showToast = (msg, isError = false) => {
+                const toast = document.createElement('div');
+                Object.assign(toast.style, {
+                    position: 'fixed', bottom: '50px', left: '50%', transform: 'translateX(-50%)',
+                    backgroundColor: isError ? '#d9534f' : '#4a9eff', color: 'white',
+                    padding: '12px 24px', borderRadius: '8px', zIndex: '10001',
+                    boxShadow: '0 4px 15px rgba(0,0,0,0.5)', transition: 'all 0.5s ease',
+                    fontWeight: 'bold', fontSize: '14px', textAlign: 'center'
+                });
+                toast.innerText = msg;
+                overlay.appendChild(toast);
+                
+                // 로그에도 출력
+                if (typeof risuai !== 'undefined' && risuai.log) {
+                    risuai.log(`[LMAI] ${msg}`);
+                }
+
+                setTimeout(() => {
+                    toast.style.opacity = '0';
+                    toast.style.bottom = '40px';
+                    setTimeout(() => toast.remove(), 500);
+                }, 3000);
+            };
+
+            // 저장 버튼 클릭 핸들러 수정
             overlay.querySelector('#lmai-save-cfg').onclick = async () => {
                 try {
+                    const maxLimitVal = overlay.querySelector('#cfg-maxLimit').value;
+                    const thresholdVal = overlay.querySelector('#cfg-threshold').value;
+                    const simThresholdVal = overlay.querySelector('#cfg-simThreshold').value;
+                    const summaryThresholdVal = overlay.querySelector('#cfg-summaryThreshold').value;
+                    const gcFrequencyVal = overlay.querySelector('#cfg-gcFrequency').value;
+
                     const newCfg = {
                         cbsEnabled: overlay.querySelector('#cfg-cbsEnabled').checked,
                         emotionEnabled: overlay.querySelector('#cfg-emotionEnabled').checked,
@@ -1409,13 +1461,16 @@
                         translationFilter: overlay.querySelector('#cfg-translationFilter').checked,
                         thinkingEnabled: overlay.querySelector('#cfg-thinkingEnabled').checked,
                         thinkingLevel: overlay.querySelector('#cfg-thinkingLevel').value,
-                        maxLimit: Number(overlay.querySelector('#cfg-maxLimit').value),
-                        threshold: Number(overlay.querySelector('#cfg-threshold').value),
-                        simThreshold: Number(overlay.querySelector('#cfg-simThreshold').value),
-                        summaryThreshold: Number(overlay.querySelector('#cfg-summaryThreshold').value),
-                        gcFrequency: Number(overlay.querySelector('#cfg-gcFrequency').value),
+
+                        // 값 검증 추가 (빈 값이면 기본값 사용)
+                        maxLimit: maxLimitVal ? Number(maxLimitVal) : 150,
+                        threshold: thresholdVal ? Number(thresholdVal) : 5,
+                        simThreshold: simThresholdVal ? Number(simThresholdVal) : 0.25,
+                        summaryThreshold: summaryThresholdVal ? Number(summaryThresholdVal) : 80,
+                        gcFrequency: gcFrequencyVal ? Number(gcFrequencyVal) : 10,
+
                         tokenizerType: overlay.querySelector('#cfg-tokenizerType').value,
-                        maxTokensPerMemory: Number(overlay.querySelector('#cfg-maxTokensPerMemory').value),
+                        maxTokensPerMemory: Number(overlay.querySelector('#cfg-maxTokensPerMemory').value) || 500,
                         customTokenizerUrl: overlay.querySelector('#cfg-customTokenizerUrl').value,
                         customTokenizerKey: overlay.querySelector('#cfg-customTokenizerKey').value,
                         mainModel: {
@@ -1433,12 +1488,14 @@
                         }
                     };
 
+                    console.log('[LMAI] Saving config:', newCfg);
+
                     await risuai.pluginStorage.setItem('LMAI_Config', JSON.stringify(newCfg));
                     await updateConfigFromArgs();
-                    alert("✅ 저장 성공");
+                    showToast("✅ 저장 성공");
                 } catch (e) { 
-                    console.error(e); 
-                    alert("❌ 저장 실패: " + e.message); 
+                    console.error('[LMAI] Save error:', e); 
+                    showToast("❌ 저장 실패: " + e.message, true); 
                 }
             };
 
