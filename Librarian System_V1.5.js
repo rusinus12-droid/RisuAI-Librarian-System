@@ -1471,3 +1471,565 @@ $$META:(\{[^}]+\})$$
         const analyzeUserIntent = (userMessage, conflictInfo) => {
             const text = userMessage.toLowerCase();
             const explicitChangePatterns = [/사실은
+// [PROCESSOR] World Adjustment Manager (계속)
+const WorldAdjustmentManager = (() => {
+    const analyzeUserIntent = (userMessage, conflictInfo) => {
+        const text = userMessage.toLowerCase();
+
+        // 명시적 변경 요청 패턴
+        const explicitChangePatterns = [
+            /사실은\s*.+인\s*거야/,
+            /알고보니\s*.+/,
+            /세계관\s*(바꿔|변경|수정)/,
+            /이제부터\s*.+/,
+            /.+가\s*아니라\s*.+/,
+            /설정\s*(바꾸|변경)/
+        ];
+
+        for (const pattern of explicitChangePatterns) {
+            if (pattern.test(text)) {
+                return { type: 'explicit_change', confidence: 0.9, reason: '사용자가 명시적으로 설정 변경을 요청함' };
+            }
+        }
+
+        // 암시적 확장 패턴
+        const implicitExpandPatterns = [
+            /새로운\s*.+/,
+            /처음\s*(보는|듣는)\s*.+/,
+            /.+라는\s*(것이|존재가)\s*있어/
+        ];
+
+        for (const pattern of implicitExpandPatterns) {
+            if (pattern.test(text)) {
+                return { type: 'implicit_expand', confidence: 0.6, reason: '이야기 전개상 새로운 요소 등장' };
+            }
+        }
+
+        // 실수/착각 가능성
+        const mistakePatterns = [/아\s*미안/, /잘못\s*(말했|적었)/, /아니\s*그게\s*아니라/];
+
+        for (const pattern of mistakePatterns) {
+            if (pattern.test(text)) {
+                return { type: 'mistake', confidence: 0.4, reason: '사용자의 실수 가능성' };
+            }
+        }
+
+        // 기본값
+        return { type: 'narrative', confidence: 0.5, reason: '일반적인 이야기 서술' };
+    };
+
+    // 충돌 감지
+    const detectConflict = (newInfo, worldProfile) => {
+        if (!worldProfile) return [];
+
+        const conflicts = [];
+        const rules = worldProfile.rules || {};
+        const exists = rules.exists || {};
+
+        // 마법 존재 여부 충돌
+        if (newInfo.mentionsMagic !== undefined && newInfo.mentionsMagic !== exists.magic) {
+            conflicts.push({
+                area: 'exists',
+                key: 'magic',
+                type: 'existence_violation',
+                existing: exists.magic,
+                new: newInfo.mentionsMagic,
+                description: `마법 존재 여부: ${exists.magic} → ${newInfo.mentionsMagic}`
+            });
+        }
+
+        // 기 존재 여부 충돌
+        if (newInfo.mentionsKi !== undefined && newInfo.mentionsKi !== exists.ki) {
+            conflicts.push({
+                area: 'exists',
+                key: 'ki',
+                type: 'existence_violation',
+                existing: exists.ki,
+                new: newInfo.mentionsKi,
+                description: `기(氣) 존재 여부: ${exists.ki} → ${newInfo.mentionsKi}`
+            });
+        }
+
+        // 신화적 존재 충돌
+        if (newInfo.mythicalCreature && exists.mythical_creatures && !exists.mythical_creatures.includes(newInfo.mythicalCreature)) {
+            conflicts.push({
+                area: 'exists',
+                key: 'mythical_creatures',
+                type: 'entity_violation',
+                existing: exists.mythical_creatures,
+                new: newInfo.mythicalCreature,
+                description: `${newInfo.mythicalCreature}는 이 세계관에 존재하지 않습니다`
+            });
+        }
+
+        // 금지 요소 충돌
+        const forbidden = worldProfile.consistency?.forbidden || [];
+        for (const item of forbidden) {
+            if (newInfo.content && newInfo.content.includes(item)) {
+                conflicts.push({
+                    area: 'forbidden',
+                    key: item,
+                    type: 'forbidden_violation',
+                    description: `"${item}"는 이 세계관에서 금지된 요소입니다`
+                });
+            }
+        }
+
+        return conflicts;
+    };
+
+    // 조정 실행
+    const executeAdjustment = (worldProfile, newInfo, adjustmentConfig, intent) => {
+        const mode = adjustmentConfig.mode;
+        const area = newInfo.area;
+        const areaConfig = adjustmentConfig.adjustableAreas[area];
+
+        if (!areaConfig?.adjustable) {
+            return { success: false, reason: '해당 영역은 조정할 수 없습니다', action: 'reject' };
+        }
+
+        // 다이내믹 모드: 맥락 기반 판단
+        if (mode === 'dynamic') {
+            if (intent.type === 'explicit_change' && intent.confidence > 0.7) {
+                // 명시적 변경 요청
+                return applyChange(worldProfile, newInfo, 'auto_adjust');
+            }
+            if (intent.type === 'implicit_expand' && intent.confidence > 0.5) {
+                // 암시적 확장
+                return applyChange(worldProfile, newInfo, 'auto_expand');
+            }
+        }
+
+        // 소프트 모드: 자동 조정
+        if (mode === 'soft') {
+            if (intent.confidence < 0.4) {
+                return applyChange(worldProfile, newInfo, 'silent_adjust');
+            }
+        }
+
+        // 하드 모드: 거부
+        if (mode === 'hard') {
+            return {
+                success: false,
+                action: 'reject_with_warning',
+                reason: '엄격 모드: 세계관 설정을 변경할 수 없습니다',
+                suggestion: '세계관 설정을 직접 수정하려면 설정 메뉴를 이용하세요'
+            };
+        }
+
+        // 기본: 확인 요청
+        return {
+            success: false,
+            action: 'confirm_needed',
+            reason: '세계관과 충돌합니다',
+            options: [
+                { label: '네, 변경합니다', action: 'accept' },
+                { label: '아니요, 유지합니다', action: 'reject' },
+                { label: '이번만 예외', action: 'exception' }
+            ]
+        };
+    };
+
+    // 변경 적용
+    const applyChange = (worldProfile, newInfo, action) => {
+        const changes = [];
+        const description = [];
+
+        if (newInfo.area === 'exists' && newInfo.key) {
+            if (['magic', 'ki', 'supernatural'].includes(newInfo.key)) {
+                worldProfile.rules.exists[newInfo.key] = newInfo.value;
+                changes.push({ path:`rules.exists.${newInfo.key}`, value: newInfo.value });
+                description.push(`${newInfo.key === 'magic' ? '마법' : newInfo.key === 'ki' ? '기(氣)' : '초자연'}: ${newInfo.value}`);
+            }
+            if (newInfo.key === 'mythical_creatures' && newInfo.value) {
+                if (!worldProfile.rules.exists.mythical_creatures.includes(newInfo.value)) {
+                    worldProfile.rules.exists.mythical_creatures.push(newInfo.value);
+                    changes.push({ path: 'rules.exists.mythical_creatures', added: newInfo.value });
+                    description.push(`신화적 존재 추가: ${newInfo.value}`);
+                }
+            }
+        }
+
+        if (newInfo.area === 'systems' && newInfo.key) {
+            worldProfile.rules.systems[newInfo.key] = newInfo.value;
+            changes.push({ path:`rules.systems.${newInfo.key}`, value: newInfo.value });
+            description.push(`시스템(${newInfo.key}): ${newInfo.value}`);
+        }
+
+        worldProfile.meta.updated = MemoryState.currentTurn;
+
+        return { success: true, action, changes, description: description.join(', ') };
+    };
+
+    return { analyzeUserIntent, detectConflict, executeAdjustment, applyChange };
+})();
+
+// ══════════════════════════════════════════════════════════════
+// [TRIGGER] RisuAI Event Handlers
+// ══════════════════════════════════════════════════════════════
+const writeMutex = { locked: false, queue: [] };
+
+const acquireLock = () => new Promise(resolve => {
+    if (!writeMutex.locked) { writeMutex.locked = true; resolve(); }
+    else writeMutex.queue.push(resolve);
+});
+
+const releaseLock = () => {
+    if (writeMutex.queue.length > 0) writeMutex.queue.shift()();
+    else writeMutex.locked = false;
+};
+
+// GENERATE_BEFORE
+if (typeof risuai !== 'undefined' && risuai.registerTrigger) {
+    risuai.registerTrigger('GENERATE_BEFORE', async (data) => {
+        try {
+            const char = await risuai.getCharacter();
+            if (!char) return data;
+
+            const chat = char.chats?.[char.chatPage];
+            if (!chat) return data;
+
+            const lore = MemoryEngine.getLorebook(char, chat);
+
+            // 캐시 초기화
+            HierarchicalWorldManager.loadWorldGraph(lore);
+            if (EntityManager.getEntityCache().size === 0) {
+                EntityManager.rebuildCache(lore);
+            }
+
+            const userMessage = data.messages?.[data.messages.length - 1]?.content || '';
+            const originalPrompt = data.prompt || '';
+
+            // 언급된 엔티티 찾기
+            const mentionedEntities = [];
+            const entityCache = EntityManager.getEntityCache();
+            for (const [name, entity] of entityCache) {
+                if (userMessage.toLowerCase().includes(name.toLowerCase())) {
+                    mentionedEntities.push(entity);
+                }
+            }
+
+            // 세계관 프롬프트 생성
+            const worldPrompt = HierarchicalWorldManager.formatForPrompt();
+
+            // 엔티티 프롬프트
+            const entityPrompt = mentionedEntities.length > 0
+                ? mentionedEntities.map(e => EntityManager.formatEntityForPrompt(e)).join('\n\n')
+                : '';
+
+            // 관계 프롬프트
+            const relationPrompt = mentionedEntities.length > 0
+                ? Array.from(EntityManager.getRelationCache().values())
+                    .filter(r => mentionedEntities.some(e => e.name === r.entityA || e.name === r.entityB))
+                    .map(r => EntityManager.formatRelationForPrompt(r))
+                    .join('\n\n')
+                : '';
+
+            // 기억 검색
+            const candidates = MemoryEngine.getManagedEntries(lore);
+            const memories = await MemoryEngine.retrieveMemories(
+                userMessage, MemoryEngine.getCurrentTurn(), candidates, {}, 10
+            );
+            const memoryText = MemoryEngine.formatMemories(memories);
+
+            // 프롬프트 구성
+            const promptParts = [];
+
+            if (originalPrompt.includes('[System]')) {
+                promptParts.push(originalPrompt);
+            } else {
+                promptParts.push('[System]\n당신은 AI 캐릭터입니다. 세계관과 캐릭터 정보를 바탕으로 일관되게 대화하세요.');
+            }
+
+            if (worldPrompt) promptParts.push('\n' + worldPrompt);
+            if (entityPrompt) promptParts.push('\n[인물 정보]\n' + entityPrompt);
+            if (relationPrompt) promptParts.push('\n[관계 정보]\n' + relationPrompt);
+            if (memories.length > 0) promptParts.push('\n[관련 기억]\n' + memoryText);
+
+            // 지시사항
+            promptParts.push('\n[지시사항]');
+            promptParts.push('1. 위 세계관 규칙을 준수하세요.');
+            promptParts.push('2. 존재하지 않는 요소(마법, 기, 레벨 등)는 언급하지 마세요.');
+            promptParts.push('3. 인물 정보를 일관되게 유지하세요.');
+
+            data.prompt = promptParts.join('\n');
+
+            if (MemoryEngine.CONFIG.debug) {
+                console.log('[LMAI] World:', HierarchicalWorldManager.getActivePath());
+                console.log('[LMAI] Entities:', mentionedEntities.length);
+            }
+
+            return data;
+        } catch (e) {
+            console.error('[LMAI] GENERATE_BEFORE Error:', e?.message || e);
+            return data;
+        }
+    });
+
+    // GENERATE_AFTER
+    risuai.registerTrigger('GENERATE_AFTER', async (data) => {
+        try {
+            const char = await risuai.getCharacter();
+            if (!char) return data;
+
+            const chat = char.chats?.[char.chatPage];
+            if (!chat) return data;
+
+            MemoryEngine.incrementTurn();
+
+            const userMsg = data.userMessage || '';
+            const aiResponse = data.reply || data.response || '';
+
+            if (!userMsg && !aiResponse) return data;
+
+            const lore = MemoryEngine.getLorebook(char, chat);
+            const config = MemoryEngine.CONFIG;
+
+            // 월드 그래프 로드
+            HierarchicalWorldManager.loadWorldGraph(lore);
+
+            // 복잡 세계관 감지
+            const complexAnalysis = ComplexWorldDetector.analyze(userMsg, aiResponse);
+
+            if (config.debug && complexAnalysis.hasComplexElements) {
+                console.log('[LMAI] Complex indicators:', complexAnalysis.indicators);
+                console.log('[LMAI] Dimensional shifts:', complexAnalysis.dimensionalShifts);
+            }
+
+            // 차원 이동 처리
+            for (const shift of complexAnalysis.dimensionalShifts) {
+                const profile = HierarchicalWorldManager.getProfile();
+                let targetNode = null;
+
+                for (const [id, node] of profile.nodes) {
+                    if (node.name.includes(shift.to) || shift.to.includes(node.name)) {
+                        targetNode = node;
+                        break;
+                    }
+                }
+
+                if (!targetNode) {
+                    const createResult = HierarchicalWorldManager.createNode({
+                        name: shift.to,
+                        layer: 'dimension',
+                        parent: profile.rootId,
+                        source: 'auto_detected'
+                    });
+                    if (createResult.success) {
+                        targetNode = createResult.node;
+                        if (config.debug) console.log('[LMAI] New dimension created:', shift.to);
+                    }
+                }
+
+                if (targetNode) {
+                    HierarchicalWorldManager.changeActivePath(targetNode.id, { method: shift.type });
+                }
+            }
+
+            // 전역 설정 업데이트
+            const profile = HierarchicalWorldManager.getProfile();
+            if (complexAnalysis.indicators.multiverse && !profile.global.multiverse) {
+                profile.global.multiverse = true;
+                profile.global.dimensionTravel = true;
+            }
+            if (complexAnalysis.indicators.timeTravel) {
+                profile.global.timeTravel = true;
+            }
+            if (complexAnalysis.indicators.metaNarrative) {
+                profile.global.metaNarrative = true;
+            }
+
+            // 엔티티 정보 추출
+            const storedInfo = EntityAwareProcessor.formatStoredInfo();
+            const entityResult = await EntityAwareProcessor.extractFromConversation(
+                userMsg, aiResponse, storedInfo, config
+            );
+
+            if (entityResult.success) {
+                // 세계관 일관성 검사
+                const currentRules = HierarchicalWorldManager.getCurrentRules();
+                for (const entityData of entityResult.entities || []) {
+                    if (!entityData.name) continue;
+                    const consistency = EntityManager.checkConsistency(entityData.name, entityData);
+                    if (!consistency.consistent && config.debug) {
+                        console.warn(`[LMAI] Entity consistency warning:`, consistency.conflicts);
+                    }
+                }
+
+                await EntityAwareProcessor.applyExtractions(entityResult, lore, config);
+            }
+
+            // 일반 기억 저장
+            const newMemory = await MemoryEngine.prepareMemory(
+                { content:`[사용자] ${userMsg}\n[응답] ${aiResponse}`, importance: 5 },
+                MemoryEngine.getCurrentTurn(), lore, lore, char, chat
+            );
+
+            if (newMemory) {
+                lore.push(newMemory);
+                MemoryEngine.setLorebook(char, chat, lore);
+            }
+
+            // 저장
+            await HierarchicalWorldManager.saveWorldGraph(char, chat, lore);
+            await EntityManager.saveToLorebook(char, chat, lore);
+            await risuai.setCharacter(char);
+
+            return data;
+        } catch (e) {
+            console.error('[LMAI] GENERATE_AFTER Error:', e?.message || e);
+            return data;
+        }
+    });
+
+    // CHAT_START
+    risuai.registerTrigger('CHAT_START', async (data) => {
+        try {
+            const char = await risuai.getCharacter();
+            if (!char) return data;
+
+            const chat = char.chats?.[char.chatPage];
+            if (!chat) return data;
+
+            const lore = MemoryEngine.getLorebook(char, chat);
+
+            // 캐시 재구축
+            MemoryEngine.rebuildIndex(lore);
+            EntityManager.rebuildCache(lore);
+            HierarchicalWorldManager.loadWorldGraph(lore);
+
+            // 턴 동기화
+            const managed = MemoryEngine.getManagedEntries(lore);
+            let maxTurn = 0;
+            for (const entry of managed) {
+                const meta = MemoryEngine.getCachedMeta(entry);
+                if (meta.t > maxTurn) maxTurn = meta.t;
+            }
+            MemoryEngine.setTurn(maxTurn + 1);
+
+            if (MemoryEngine.CONFIG.debug) {
+                console.log(`[LMAI] Chat started. Turn: ${MemoryEngine.getCurrentTurn()}, Memories: ${managed.length}`);
+                console.log(`[LMAI] Entities: ${EntityManager.getEntityCache().size}, Relations: ${EntityManager.getRelationCache().size}`);
+            }
+
+            return data;
+        } catch (e) {
+            console.error('[LMAI] CHAT_START Error:', e?.message || e);
+            return data;
+        }
+    });
+}
+
+// ══════════════════════════════════════════════════════════════
+// [MAIN] Initialization
+// ══════════════════════════════════════════════════════════════
+const updateConfigFromArgs = async () => {
+    const cfg = MemoryEngine.CONFIG;
+    let local = {};
+
+    try {
+        const saved = await risuai.pluginStorage.getItem('LMAI_Config');
+        if (saved) local = typeof saved === 'string' ? JSON.parse(saved) : saved;
+    } catch (e) {
+        console.warn('[LMAI] Config load failed:', e?.message || e);
+    }
+
+    const getVal = (key, argName, type, parent, fallback) => {
+        const localVal = parent ? local[parent]?.[key] : local[key];
+        let argVal;
+        try { argVal = risuai.getArgument(argName); } catch {}
+        const configVal = parent ? cfg[parent]?.[key] : cfg[key];
+        const raw = localVal !== undefined ? localVal : argVal !== undefined ? argVal : configVal !== undefined ? configVal : fallback;
+
+        if (raw === undefined || raw === null) return fallback;
+
+        switch (type) {
+            case 'number': { const n = Number(raw); return isNaN(n) ? (fallback ?? configVal) : n; }
+            case 'boolean': return raw === true || raw === 1 || raw === 'true' || raw === '1';
+            default: return String(raw);
+        }
+    };
+
+    cfg.maxLimit = getVal('maxLimit', 'max_limit', 'number', null, 200);
+    cfg.threshold = getVal('threshold', 'threshold', 'number', null, 5);
+    cfg.simThreshold = getVal('simThreshold', 'sim_threshold', 'number', null, 0.25);
+    cfg.debug = getVal('debug', 'debug', 'boolean', null, false);
+    cfg.useLLM = getVal('useLLM', 'use_llm', 'boolean', null, true);
+    cfg.worldAdjustmentMode = getVal('worldAdjustmentMode', 'world_adjustment_mode', 'string', null, 'dynamic');
+
+    cfg.llm = {
+        provider: getVal('provider', 'llm_provider', 'string', 'llm', 'openai'),
+        url: getVal('url', 'llm_url', 'string', 'llm', ''),
+        key: getVal('key', 'llm_key', 'string', 'llm', ''),
+        model: getVal('model', 'llm_model', 'string', 'llm', 'gpt-4o-mini'),
+        temp: getVal('temp', 'llm_temp', 'number', 'llm', 0.3),
+        timeout: getVal('timeout', 'llm_timeout', 'number', 'llm', 15000)
+    };
+
+    cfg.embed = {
+        provider: getVal('provider', 'embed_provider', 'string', 'embed', 'openai'),
+        url: getVal('url', 'embed_url', 'string', 'embed', ''),
+        key: getVal('key', 'embed_key', 'string', 'embed', ''),
+        model: getVal('model', 'embed_model', 'string', 'embed', 'text-embedding-3-small')
+    };
+
+    const mode = (getVal('weightMode', 'weight_mode', 'string', null, 'auto')).toLowerCase();
+    cfg.weightMode = mode;
+
+    const presets = {
+        romance: { similarity: 0.5, importance: 0.3, recency: 0.2 },
+        action: { similarity: 0.4, importance: 0.2, recency: 0.4 },
+        mystery: { similarity: 0.4, importance: 0.5, recency: 0.1 },
+        daily: { similarity: 0.3, importance: 0.3, recency: 0.4 }
+    };
+
+    if (presets[mode]) {
+        cfg.weights = presets[mode];
+    } else {
+        cfg.weights = {
+            similarity: getVal('w_sim', 'w_sim', 'number', null, 0.5),
+            importance: getVal('w_imp', 'w_imp', 'number', null, 0.3),
+            recency: getVal('w_rec', 'w_rec', 'number', null, 0.2)
+        };
+        const sum = cfg.weights.similarity + cfg.weights.importance + cfg.weights.recency;
+        if (Math.abs(sum - 1) > 0.01) {
+            cfg.weights.similarity /= sum;
+            cfg.weights.importance /= sum;
+            cfg.weights.recency /= sum;
+        }
+    }
+};
+
+// Initialize
+(async () => {
+    try {
+        console.log('[LMAI] v6.0 Initializing...');
+        await updateConfigFromArgs();
+
+        if (typeof risuai !== 'undefined') {
+            const char = await risuai.getCharacter();
+            const chat = char?.chats?.[char.chatPage];
+            const lore = MemoryEngine.getLorebook(char, chat);
+            MemoryEngine.rebuildIndex(lore);
+        }
+
+        MemoryState.isInitialized = true;
+        console.log(`[LMAI] v6.0 Ready. LLM=${MemoryEngine.CONFIG.useLLM} | Mode=${MemoryEngine.CONFIG.weightMode}`);
+    } catch (e) {
+        console.error("[LMAI] Init Error:", e?.message || e);
+    }
+})();
+
+// Export
+if (typeof globalThis !== 'undefined') {
+    globalThis.LMAI = {
+        MemoryEngine,
+        EntityManager,
+        HierarchicalWorldManager,
+        ComplexWorldDetector,
+        WorldAdjustmentManager,
+        MemoryState
+    };
+}
+
+})();
