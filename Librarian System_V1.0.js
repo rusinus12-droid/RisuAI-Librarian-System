@@ -1,5 +1,5 @@
 //@name long_memory_ai_assistant
-//@display-name Librarian System V1.0
+//@display-name Librarian System V1.2
 //@author rusinus12@gmail.com
 //@api 3.0
 //@version 2.7.6
