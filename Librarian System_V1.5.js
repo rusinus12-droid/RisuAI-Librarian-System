@@ -1,12 +1,12 @@
 //@name long_memory_ai_assistant
-//@display-name Librarian System v3.7.1 (Bug Fix & Optimization)
+//@display-name Librarian System v4.0 Pro (With LLM Processor)
 //@author rusinus12@gmail.com
 //@api 3.0
-//@version 3.7.1
+//@version 4.0.0
 
 (async () => {
     // ══════════════════════════════════════════════════════════════
-    // [CORE] Global Error Handler
+    // [CORE] Error Handler
     // ══════════════════════════════════════════════════════════════
     class LMAIError extends Error {
         constructor(message, code, cause = null) {
@@ -26,7 +26,9 @@
         hashIndex: new Map(),
         metaCache: null,
         simCache: null,
+        sessionCache: new Map(), // LLM 응답 캐시
         isInitialized: false,
+        currentTurn: 0,
         initVersion: 0,
 
         reset() {
@@ -34,6 +36,7 @@
             this.hashIndex.clear();
             this.metaCache?.cache?.clear();
             this.simCache?.cache?.clear();
+            this.sessionCache.clear();
             this.initVersion++;
         }
     };
@@ -70,15 +73,8 @@
             });
         }
 
-        readUnlock() {
-            this.readers--;
-            this._next();
-        }
-
-        writeUnlock() {
-            this.writer = false;
-            this._next();
-        }
+        readUnlock() { this.readers--; this._next(); }
+        writeUnlock() { this.writer = false; this._next(); }
 
         _next() {
             while (this.queue.length > 0) {
@@ -118,10 +114,7 @@
         }
 
         get(k) {
-            if (!this.cache.has(k)) {
-                this.misses++;
-                return undefined;
-            }
+            if (!this.cache.has(k)) { this.misses++; return undefined; }
             this.hits++;
             const v = this.cache.get(k);
             this.cache.delete(k);
@@ -129,9 +122,7 @@
             return v;
         }
 
-        peek(k) {
-            return this.cache.get(k);
-        }
+        peek(k) { return this.cache.get(k); }
 
         set(k, v) {
             if (this.cache.has(k)) this.cache.delete(k);
@@ -143,24 +134,15 @@
 
         has(k) { return this.cache.has(k); }
         delete(k) { return this.cache.delete(k); }
-        clear() {
-            this.cache.clear();
-            this.hits = 0;
-            this.misses = 0;
-        }
-
+        clear() { this.cache.clear(); this.hits = 0; this.misses = 0; }
         get stats() {
             const total = this.hits + this.misses;
-            return {
-                size: this.cache.size,
-                hitRate: total > 0 ? (this.hits / total).toFixed(3) : 0
-            };
+            return { size: this.cache.size, hitRate: total > 0 ? (this.hits / total).toFixed(3) : 0 };
         }
     }
 
     // ══════════════════════════════════════════════════════════════
     // [ENGINE] Tokenizer & Hash
-    // [FIX-3] 해시 충돌 방지를 위해 토큰 참조 개수 증가 + 텍스트 길이 반영
     // ══════════════════════════════════════════════════════════════
     const TokenizerEngine = (() => {
         const simpleHash = (s) => {
@@ -182,22 +164,15 @@
                 .split(/\s+/)
                 .filter(w => w.length > 1);
 
-        // [FIX-3] 개선된 인덱스 키 생성
-        // - 처음 5개 + 마지막 3개 토큰 사용 (기존: 3 + 2)
-        // - 전체 텍스트 길이를 해시에 포함하여 유사 길이 문장 구분
-        // - 토큰이 부족하면 전체 토큰 사용
         const getIndexKey = (text) => {
             const tokens = tokenize(text);
             const textLen = text.length;
-
             let combined;
             if (tokens.length <= 8) {
                 combined = tokens.join("_");
             } else {
                 combined = [...tokens.slice(0, 5), ...tokens.slice(-3)].join("_");
             }
-
-            // 텍스트 길이를 포함하여 유사 문장 구분 강화
             return simpleHash(`${combined}_${textLen}`);
         };
 
@@ -211,167 +186,7 @@
     })();
 
     // ══════════════════════════════════════════════════════════════
-    // [ENGINE] Safe Expression Evaluator
-    // ══════════════════════════════════════════════════════════════
-    const SafeEvaluator = (() => {
-        const OPERATORS = {
-            '+': (a, b) => a + b,
-            '-': (a, b) => a - b,
-            '*': (a, b) => a * b,
-            '/': (a, b) => b !== 0 ? a / b : 0,
-            '%': (a, b) => a % b,
-            '>': (a, b) => a > b,
-            '<': (a, b) => a < b,
-            '>=': (a, b) => a >= b,
-            '<=': (a, b) => a <= b,
-            '==': (a, b) => a == b,
-            '!=': (a, b) => a != b,
-            '&&': (a, b) => a && b,
-            '||': (a, b) => a || b
-        };
-
-        const PRECEDENCE = {
-            '||': 1, '&&': 2,
-            '==': 3, '!=': 3,
-            '>': 4, '<': 4, '>=': 4, '<=': 4,
-            '+': 5, '-': 5,
-            '*': 6, '/': 6, '%': 6
-        };
-
-        const tokenize = (expr) => {
-            const tokens = [];
-            let i = 0;
-            while (i < expr.length) {
-                const ch = expr[i];
-                if (/\s/.test(ch)) { i++; continue; }
-
-                if (/\d/.test(ch) || (ch === '-' && i + 1 < expr.length && /\d/.test(expr[i + 1]))) {
-                    let num = '';
-                    if (ch === '-') { num += ch; i++; }
-                    while (i < expr.length && /[\d.]/.test(expr[i])) {
-                        num += expr[i++];
-                    }
-                    tokens.push({ type: 'number', value: parseFloat(num) });
-                    continue;
-                }
-
-                if (ch === '"' || ch === "'") {
-                    const quote = ch;
-                    let str = '';
-                    i++;
-                    while (i < expr.length && expr[i] !== quote) {
-                        str += expr[i++];
-                    }
-                    i++;
-                    tokens.push({ type: 'string', value: str });
-                    continue;
-                }
-
-                const twoChar = expr.slice(i, i + 2);
-                if (OPERATORS[twoChar]) {
-                    tokens.push({ type: 'operator', value: twoChar });
-                    i += 2;
-                    continue;
-                }
-
-                if (OPERATORS[ch]) {
-                    tokens.push({ type: 'operator', value: ch });
-                    i++;
-                    continue;
-                }
-
-                if (ch === '(' || ch === ')') {
-                    tokens.push({ type: 'paren', value: ch });
-                    i++;
-                    continue;
-                }
-
-                i++;
-            }
-            return tokens;
-        };
-
-        const parse = (tokens) => {
-            let pos = 0;
-
-            const parseAtom = () => {
-                const token = tokens[pos];
-                if (!token) return null;
-
-                if (token.type === 'number' || token.type === 'string') {
-                    pos++;
-                    return { type: 'literal', value: token.value };
-                }
-
-                if (token.type === 'paren' && token.value === '(') {
-                    pos++;
-                    const expr = parseExpression();
-                    if (tokens[pos]?.value === ')') pos++;
-                    return expr;
-                }
-
-                return null;
-            };
-
-            const parseBinary = (leftPrec) => {
-                let left = parseAtom();
-                if (!left) return null;
-
-                while (true) {
-                    const op = tokens[pos];
-                    if (!op || op.type !== 'operator') break;
-                    const prec = PRECEDENCE[op.value];
-                    if (prec === undefined || prec <= leftPrec) break;
-
-                    pos++;
-                    const right = parseBinary(prec);
-                    if (!right) break;
-
-                    left = { type: 'binary', op: op.value, left, right };
-                }
-
-                return left;
-            };
-
-            const parseExpression = () => parseBinary(0);
-            return parseExpression();
-        };
-
-        const evaluate = (ast, vars = {}) => {
-            if (!ast) return '';
-
-            if (ast.type === 'literal') return ast.value;
-
-            if (ast.type === 'binary') {
-                const left = evaluate(ast.left, vars);
-                const right = evaluate(ast.right, vars);
-                const op = OPERATORS[ast.op];
-
-                if (!op) return 0;
-                const result = op(left, right);
-                return typeof result === 'boolean' ? (result ? 1 : 0) : result;
-            }
-
-            return '';
-        };
-
-        return {
-            evaluate: (expr, vars = {}) => {
-                try {
-                    const tokens = tokenize(String(expr || ''));
-                    const ast = parse(tokens);
-                    if (!ast) return expr || '';
-                    const result = evaluate(ast, vars);
-                    return result == null ? '' : String(result);
-                } catch {
-                    return '';
-                }
-            }
-        };
-    })();
-
-    // ══════════════════════════════════════════════════════════════
-    // [FIX-4] Embedding Queue - 재귀 제거, while 루프 기반으로 변경
+    // [ENGINE] Embedding Queue
     // ══════════════════════════════════════════════════════════════
     const EmbeddingQueue = (() => {
         const q = [];
@@ -380,19 +195,14 @@
         let running = false;
 
         const run = async () => {
-            // 이미 실행 중이면 중복 실행 방지
             if (running) return;
             running = true;
-
             try {
-                // while 루프로 변경: 재귀 호출 제거
                 while (q.length > 0 && active < MAX_CONCURRENT) {
                     active++;
                     const { task, resolve, reject } = q.shift();
-
                     try {
-                        const result = await task();
-                        resolve(result);
+                        resolve(await task());
                     } catch (e) {
                         reject(e);
                     } finally {
@@ -407,109 +217,221 @@
         return {
             enqueue: (task) => new Promise((res, rej) => {
                 q.push({ task, resolve: res, reject: rej });
-                run(); // 큐에 추가 후 실행 트리거
+                run();
             }),
-
             get queueLength() { return q.length; },
             get activeCount() { return active; }
         };
     })();
 
     // ══════════════════════════════════════════════════════════════
-    // [FIX-2] Emotion Analyzer - 부정어 처리 및 오탐지 방지
+    // [ENGINE] Emotion Analyzer (보조)
     // ══════════════════════════════════════════════════════════════
     const EmotionEngine = (() => {
-        // 부정어 목록 (한글)
         const NEGATION_WORDS = ['않', '안', '못', '말', '미', '노', '누', '구', '별로', '전혀', '절대'];
-
-        // 부정어 감지 윈도우 (키워드 앞뒤 몇 글자 내에 부정어가 있으면 무시)
         const NEGATION_WINDOW = 5;
 
-        const EMOTION_KEYWORDS = {
-            joy: ['기쁘', '행복', '좋아', '웃', '미소', '즐거', '환한', '밝게', '설레', '감사', '기뻐', '좋아하'],
-            sadness: ['슬프', '우울', '눈물', '울', '흐느끼', '비통', '애도', '그리워', '외로', '서운', '속상'],
-            anger: ['화나', '분노', '짜증', '열받', '억울', '폭발', '소리치', '으르렁', '성가', '화가'],
-            fear: ['무서', '두려', '공포', '불안', '겁', '떨', '긴장', '위험', '무서워'],
-            surprise: ['놀라', '충격', '예상치', '돌발', '어이없', '깜짝', '놀라워'],
-            disgust: ['역겨', '혐오', '싫어', '지긋지긋', '구역질', '恶心', '징그러']
-        };
-
-        // 부정어가 키워드 근처에 있는지 확인
         const hasNegationNearby = (text, matchIndex, keyword) => {
             const start = Math.max(0, matchIndex - NEGATION_WINDOW - keyword.length);
             const end = Math.min(text.length, matchIndex + NEGATION_WINDOW);
             const context = text.slice(start, end);
-
-            for (const negWord of NEGATION_WORDS) {
-                if (context.includes(negWord)) {
-                    return true;
-                }
-            }
-            return false;
+            return NEGATION_WORDS.some(neg => context.includes(neg));
         };
 
         const analyze = (text) => {
-            const scores = {};
-            let total = 0;
-            const lowerText = text.toLowerCase();
-            const detectedKeywords = [];
+            const lowerText = (text || "").toLowerCase();
+            let score = 0;
+            const emotions = { joy: 0, sadness: 0, anger: 0, fear: 0, surprise: 0, disgust: 0 };
 
-            for (const [emotion, words] of Object.entries(EMOTION_KEYWORDS)) {
-                let score = 0;
+            const keywords = {
+                joy: ['기쁘', '행복', '좋아', '웃', '미소', '즐거'],
+                sadness: ['슬프', '우울', '눈물', '울', '그리워'],
+                anger: ['화나', '분노', '짜증', '열받'],
+                fear: ['무서', '두려', '공포', '불안'],
+                surprise: ['놀라', '충격', '깜짝'],
+                disgust: ['역겨', '혐오', '싫어']
+            };
+
+            for (const [emotion, words] of Object.entries(keywords)) {
                 for (const word of words) {
-                    let searchPos = 0;
-                    while (true) {
-                        const idx = lowerText.indexOf(word, searchPos);
-                        if (idx === -1) break;
-
-                        // [FIX-2] 부정어 검사
+                    let idx = lowerText.indexOf(word);
+                    while (idx !== -1) {
                         if (!hasNegationNearby(lowerText, idx, word)) {
+                            emotions[emotion]++;
                             score++;
-                            detectedKeywords.push({ emotion, word, index: idx });
                         }
-                        searchPos = idx + 1;
-                    }
-                }
-                scores[emotion] = score;
-                total += score;
-            }
-
-            // [FIX-2] 토큰 기반 정밀 검사 (보조)
-            // 공백으로 분리된 완전 일치 단어에 가중치 부여
-            const tokens = TokenizerEngine.tokenize(text);
-            for (const token of tokens) {
-                for (const [emotion, words] of Object.entries(EMOTION_KEYWORDS)) {
-                    if (words.some(w => token === w || token.startsWith(w))) {
-                        // 부정어가 토큰 자체에 포함되어 있는지 확인
-                        const hasNegation = NEGATION_WORDS.some(neg => token.includes(neg));
-                        if (!hasNegation) {
-                            scores[emotion] += 0.5; // 추가 가중치
-                        }
+                        idx = lowerText.indexOf(word, idx + 1);
                     }
                 }
             }
 
-            const dominant = Object.entries(scores)
-                .filter(([, s]) => s > 0)
-                .sort((a, b) => b[1] - a[1])[0];
-
+            const dominant = Object.entries(emotions).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1])[0];
             return {
-                scores,
+                scores: emotions,
                 dominant: dominant ? dominant[0] : 'neutral',
-                intensity: total > 0 ? Math.min(1, total / 5) : 0,
-                keywords: detectedKeywords
+                intensity: Math.min(1, score / 5)
             };
         };
 
-        return { analyze, NEGATION_WORDS, EMOTION_KEYWORDS };
+        return { analyze, NEGATION_WORDS };
     })();
 
     // ══════════════════════════════════════════════════════════════
-    // [CORE] Memory Engine (v3.7.1 - Bug Fixed)
+    // [NEW] LLM Memory Processor (v4.0 핵심)
+    // ══════════════════════════════════════════════════════════════
+    const LLMProcessor = (() => {
+        const MEMORY_PROMPT = `당신은 대화 기록을 분석하여 장기 기억 데이터를 생성하는 전문가입니다.
+
+[입력]
+최근 대화 내용
+
+[작업]
+1. 장기적으로 기억해야 할 핵심 정보 추출 (일상 인사/감정 표현 제외)
+2. 사실(Fact), 선호(Preference), 관계(Relationship), 계획(Plan) 위주
+
+[출력 형식] 오직 JSON만 출력:
+{
+  "shouldSave": true/false,
+  "summary": "한 문장 요약 (50자 이내)",
+  "facts": ["주체: 내용", "주체: 내용"],
+  "importance": 1-10,
+  "category": "personal|relationship|knowledge|plan|event",
+  "entities": ["이름1", "이름2"],
+  "sentiment": "positive|negative|neutral"
+}
+
+[규칙]
+- 이미 알려진 정보나 중복 내용은 shouldSave: false
+- 추측 금지, 명시된 내용만 저장
+- 문장은 간결하게`;
+
+        /**
+         * LLM 호출을 통한 기억 처리
+         * @param {string} userMsg - 사용자 메시지
+         * @param {string} aiResponse - AI 응답
+         * @param {object} config - 설정 객체
+         * @returns {Promise<object|null>} 처리된 기억 객체 또는 null
+         */
+        const processMemory = async (userMsg, aiResponse, config) => {
+            const model = config.mainModel;
+            if (!model?.url || !model?.key) {
+                // LLM 설정이 없으면 폴백: 원문 저장
+                console.warn('[LMAI] No LLM configured, using fallback');
+                return {
+                    shouldSave: true,
+                    summary: `[사용자] ${userMsg.slice(0, 50)}... [응답] ${aiResponse.slice(0, 50)}...`,
+                    facts: [],
+                    importance: 5,
+                    category: 'personal',
+                    entities: [],
+                    sentiment: 'neutral',
+                    fallback: true
+                };
+            }
+
+            const inputText = `[사용자]\n${userMsg}\n\n[응답]\n${aiResponse}`;
+
+            // 캐시 확인
+            const cacheKey = TokenizerEngine.simpleHash(inputText);
+            if (MemoryState.sessionCache.has(cacheKey)) {
+                return MemoryState.sessionCache.get(cacheKey);
+            }
+
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 10000); // 10초 타임아웃
+
+                const response = await risuai.fetch(model.url, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${model.key}`
+                    },
+                    body: JSON.stringify({
+                        model: model.model || 'gpt-4o-mini',
+                        messages: [
+                            { role: 'system', content: MEMORY_PROMPT },
+                            { role: 'user', content: inputText }
+                        ],
+                        temperature: 0.3,
+                        max_tokens: 500
+                    }),
+                    signal: controller.signal
+                });
+
+                clearTimeout(timeout);
+
+                if (!response.ok) {
+                    throw new LMAIError(`LLM API Error: ${response.status}`, 'LLM_API_ERROR');
+                }
+
+                const data = await response.json();
+                const content = data.choices?.[0]?.message?.content || '';
+
+                // JSON 추출 (```json ...``` 블록 처리)
+                let jsonStr = content;
+                const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/);
+                if (jsonMatch) {
+                    jsonStr = jsonMatch[1].trim();
+                } else {
+                    // { } 사이 내용 추출
+                    const braceStart = content.indexOf('{');
+                    const braceEnd = content.lastIndexOf('}');
+                    if (braceStart !== -1 && braceEnd !== -1) {
+                        jsonStr = content.slice(braceStart, braceEnd + 1);
+                    }
+                }
+
+                const result = JSON.parse(jsonStr);
+
+                // 검증
+                if (typeof result.shouldSave !== 'boolean') {
+                    result.shouldSave = true;
+                }
+                if (typeof result.importance !== 'number' || result.importance < 1 || result.importance > 10) {
+                    result.importance = 5;
+                }
+
+                // 캐시 저장
+                MemoryState.sessionCache.set(cacheKey, result);
+
+                if (config.debug) {
+                    console.log('[LMAI] LLM Processed:', result);
+                }
+
+                return result;
+
+            } catch (e) {
+                if (e.name === 'AbortError') {
+                    console.warn('[LMAI] LLM Timeout - using fallback');
+                } else {
+                    console.error('[LMAI] LLM Processing Error:', e?.message || e);
+                }
+
+                // 에러 시 폴백
+                return {
+                    shouldSave: true,
+                    summary: userMsg.slice(0, 100),
+                    facts: [],
+                    importance: 5,
+                    category: 'personal',
+                    entities: [],
+                    sentiment: 'neutral',
+                    fallback: true,
+                    error: e?.message
+                };
+            }
+        };
+
+        return { processMemory };
+    })();
+
+    // ══════════════════════════════════════════════════════════════
+    // [CORE] Memory Engine (v4.0)
     // ══════════════════════════════════════════════════════════════
     const MemoryEngine = (() => {
         const CONFIG = {
-            maxLimit: 150,
+            maxLimit: 200,
             threshold: 5,
             simThreshold: 0.25,
             gcBatchSize: 5,
@@ -520,89 +442,56 @@
             cbsEnabled: true,
             emotionEnabled: true,
             loreComment: "lmai_memory",
-            mainModel: { format: "openai", url: "", key: "", model: "", temp: 0.7 },
+            injectionTemplate: "[관련 기억]\n{{memories}}\n[/관련 기억]",
+            useLLM: true, // v4.0: LLM 사용 여부
+            mainModel: { format: "openai", url: "", key: "", model: "gpt-4o-mini", temp: 0.3 },
             embedModel: { format: "openai", url: "", key: "", model: "text-embedding-3-small" }
         };
 
         const getMetaCache = () => {
-            if (!MemoryState.metaCache) {
-                MemoryState.metaCache = new LRUCache(2000);
-            }
+            if (!MemoryState.metaCache) MemoryState.metaCache = new LRUCache(2000);
             return MemoryState.metaCache;
         };
 
         const getSimCache = () => {
-            if (!MemoryState.simCache) {
-                MemoryState.simCache = new LRUCache(5000);
-            }
+            if (!MemoryState.simCache) MemoryState.simCache = new LRUCache(5000);
             return MemoryState.simCache;
         };
 
-        // ═══════════════════════════════════════════════════════════
-        // [FIX-2] Genre Detection - 부정어 처리 및 정교화
-        // ═══════════════════════════════════════════════════════════
         const GENRE_KEYWORDS = {
-            action: ['공격', '회피', '기습', '위험', '비명', '달려', '총', '검', '폭발', '피격', '격투', '추격', '싸움', '전투'],
-            romance: ['사랑', '좋아', '키스', '안아', '입술', '눈물', '손잡', '두근', '설레', '고백', '포옹', '그리워', '연인', '키스해'],
-            mystery: ['단서', '증거', '범인', '비밀', '거짓말', '수상', '추리', '의심', '진실', '조사', '누가', '왜', '범죄'],
-            daily: ['밥', '날씨', '오늘', '일상', '학교', '회사', '집에', '친구', '쇼핑', '영화', '산책', '점심', '아침']
+            action: ['공격', '회피', '기습', '위험', '비명', '달려', '총', '검', '폭발', '피격', '격투', '추격'],
+            romance: ['사랑', '좋아', '키스', '안아', '입술', '눈물', '손잡', '두근', '설레', '고백', '포옹', '그리워'],
+            mystery: ['단서', '증거', '범인', '비밀', '거짓말', '수상', '추리', '의심', '진실', '조사', '누가', '왜'],
+            daily: ['밥', '날씨', '오늘', '일상', '학교', '회사', '집에', '친구', '쇼핑', '영화', '산책']
         };
 
-        // 감정-장르 매핑 (보조)
         const EMOTION_GENRE_MAP = {
-            sadness: 'romance',
-            anger: 'action',
-            fear: 'mystery',
-            joy: 'daily',
-            surprise: 'action'
+            sadness: 'romance', anger: 'action', fear: 'mystery', joy: 'daily', surprise: 'action'
         };
 
         const detectGenreWeights = (query) => {
             if (CONFIG.weightMode !== 'auto') return null;
-
             const text = (query || "").toLowerCase();
             const scores = { action: 0, romance: 0, mystery: 0, daily: 0 };
-            const matchedKeywords = [];
 
             for (const [genre, words] of Object.entries(GENRE_KEYWORDS)) {
                 for (const word of words) {
-                    let searchPos = 0;
-                    while (true) {
-                        const idx = text.indexOf(word, searchPos);
-                        if (idx === -1) break;
-
-                        // [FIX-2] 부정어 검사
-                        const hasNegation = EmotionEngine.NEGATION_WORDS.some(neg => {
-                            const start = Math.max(0, idx - EmotionEngine.NEGATION_WINDOW);
-                            const end = Math.min(text.length, idx + word.length + EmotionEngine.NEGATION_WINDOW);
-                            return text.slice(start, end).includes(neg);
-                        });
-
-                        if (!hasNegation) {
-                            scores[genre]++;
-                            matchedKeywords.push({ genre, word });
-                        }
-                        searchPos = idx + 1;
-                    }
+                    if (text.includes(word)) scores[genre]++;
                 }
-
-                // 액션: 느낌표 가산
-                if (genre === 'action' && /!/.test(text)) scores.action += 0.5;
             }
 
-            // [FIX-2] 감정 기반 장르 보정
             if (CONFIG.emotionEnabled) {
                 const emotion = EmotionEngine.analyze(text);
                 if (emotion.dominant !== 'neutral' && emotion.intensity > 0.3) {
-                    const mappedGenre = EMOTION_GENRE_MAP[emotion.dominant];
-                    if (mappedGenre && scores[mappedGenre] !== undefined) {
-                        scores[mappedGenre] += emotion.intensity * 0.5;
+                    const mapped = EMOTION_GENRE_MAP[emotion.dominant];
+                    if (mapped && scores[mapped] !== undefined) {
+                        scores[mapped] += emotion.intensity;
                     }
                 }
             }
 
-            const topGenre = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
-            if (topGenre[1] < 1) return null;
+            const top = Object.entries(scores).sort((a, b) => b[1] - a[1])[0];
+            if (top[1] < 1) return null;
 
             const PRESETS = {
                 action: { similarity: 0.4, importance: 0.2, recency: 0.4 },
@@ -611,36 +500,22 @@
                 daily: { similarity: 0.3, importance: 0.3, recency: 0.4 }
             };
 
-            if (CONFIG.debug) {
-                const scoreStr = Object.entries(scores).map(([g, s]) => `${g}:${s.toFixed(1)}`).join(', ');
-                console.log(`[LMAI] Genre Detection [${topGenre[0].toUpperCase()}] scores={${scoreStr}}`);
-            }
-
-            return PRESETS[topGenre[0]];
+            return PRESETS[top[0]];
         };
 
-        const calculateDynamicWeights = (query) => {
-            const detected = detectGenreWeights(query);
-            return detected || CONFIG.weights;
-        };
-
+        const calculateDynamicWeights = (query) => detectGenreWeights(query) || CONFIG.weights;
         const _log = (msg) => { if (CONFIG.debug) console.log(`[LMAI] ${msg}`); };
-
-        const getSafeKey = (entry) =>
-            entry.id || TokenizerEngine.getSafeMapKey(entry.content || "");
+        const getSafeKey = (entry) => entry.id || TokenizerEngine.getSafeMapKey(entry.content || "");
 
         const META_PATTERN = /\[META:(\{[^}]+\})\]/;
 
         const parseMeta = (raw) => {
-            const def = { t: 0, ttl: 0, imp: 5, type: 'context' };
+            const def = { t: 0, ttl: 0, imp: 5, type: 'context', cat: 'personal', ent: [] };
             if (typeof raw !== 'string') return def;
             try {
                 const m = raw.match(META_PATTERN);
                 return m ? { ...def, ...JSON.parse(m[1]) } : def;
-            } catch (e) {
-                if (CONFIG.debug) console.warn('[LMAI] parseMeta error:', e?.message);
-                return def;
-            }
+            } catch { return def; }
         };
 
         const getCachedMeta = (entry) => {
@@ -657,23 +532,17 @@
             const hA = TokenizerEngine.simpleHash(textA);
             const hB = TokenizerEngine.simpleHash(textB);
             const cKey = hA < hB ? `${hA}_${hB}` : `${hB}_${hA}`;
-
             const simCache = getSimCache();
             if (simCache.has(cKey)) return simCache.get(cKey);
 
             const lenA = textA.length, lenB = textB.length;
-            if (Math.abs(lenA - lenB) > Math.max(lenA, lenB) * 0.7) {
-                simCache.set(cKey, 0);
-                return 0;
-            }
+            if (Math.abs(lenA - lenB) > Math.max(lenA, lenB) * 0.7) { simCache.set(cKey, 0); return 0; }
 
             const tA = new Set(TokenizerEngine.tokenize(textA));
             const tB = new Set(TokenizerEngine.tokenize(textB));
             let inter = 0;
             tA.forEach(w => { if (tB.has(w)) inter++; });
-            const jaccard = (tA.size + tB.size) > 0
-                ? inter / (tA.size + tB.size - inter)
-                : 0;
+            const jaccard = (tA.size + tB.size) > 0 ? inter / (tA.size + tB.size - inter) : 0;
 
             if (jaccard < 0.1) { simCache.set(cKey, 0); return 0; }
 
@@ -688,8 +557,7 @@
             return score;
         };
 
-        const calcRecency = (turn, current) =>
-            Math.exp(-Math.max(0, current - turn) / 20);
+        const calcRecency = (turn, current) => Math.exp(-Math.max(0, current - turn) / 20);
 
         // ═══════════════════════════════════════════════════════════
         // Embedding Engine
@@ -725,11 +593,7 @@
                             return vec;
                         } catch (e) {
                             clearTimeout(timeout);
-                            if (e.name === 'AbortError') {
-                                console.warn(`[LMAI] Embedding Timeout: "${text.slice(0, 20)}..."`);
-                            } else {
-                                console.error(`[LMAI] Embedding Error:`, e?.message || e);
-                            }
+                            if (CONFIG.debug) console.warn(`[LMAI] Embedding Error:`, e?.message || e);
                             return null;
                         }
                     });
@@ -749,24 +613,33 @@
         })();
 
         // ═══════════════════════════════════════════════════════════
-        // CBS Engine
+        // Memory Formatter (v4.0 - 개선된 포맷)
         // ═══════════════════════════════════════════════════════════
-        const CBSEngine = (() => {
-            const safeTrim = (v) => typeof v === "string" ? v.trim() : "";
+        const formatMemories = (memories) => {
+            if (!memories || memories.length === 0) return '';
 
-            return {
-                process: async (text) => {
-                    if (!CONFIG.cbsEnabled) return text;
-                    return text;
-                },
-                clean: (text) => typeof text === 'string'
-                    ? text.replace(/<[^>]+>/g, '').replace(/\{\{[\s\S]*?\}\}/g, '').trim()
-                    : ""
-            };
-        })();
+            const formatted = memories.map((m, i) => {
+                const meta = getCachedMeta(m);
+                const content = (m.content || "").replace(META_PATTERN, '').trim();
+                const imp = meta.imp || 5;
+                const cat = meta.cat || 'personal';
+                const turn = meta.t || 0;
+
+                // v4.0: 구조화된 내용 반환
+                let entry = `[${i + 1}] (중요도:${imp}/10 | ${cat} | 턴:${turn})`;
+                if (meta.summary) {
+                    entry += `\n    요약: ${meta.summary}`;
+                }
+                entry += `\n    ${content}`;
+
+                return entry;
+            }).join('\n\n');
+
+            return CONFIG.injectionTemplate.replace('{{memories}}', formatted);
+        };
 
         // ═══════════════════════════════════════════════════════════
-        // [FIX-1] incrementalGC - 반환값 활용 및 상태 업데이트
+        // GC with State Update
         // ═══════════════════════════════════════════════════════════
         const incrementalGC = (allEntries, currentTurn) => {
             const toDelete = new Set();
@@ -793,20 +666,20 @@
             }
 
             if (toDelete.size > 0) {
-                MemoryState.hashIndex.forEach((set, key) => {
+                MemoryState.hashIndex.forEach((set) => {
                     toDelete.forEach(item => set.delete(item));
+                });
+                MemoryState.hashIndex.forEach((set, key) => {
                     if (set.size === 0) MemoryState.hashIndex.delete(key);
                 });
-                // [FIX-1] 결과 객체 반환 (entries + 삭제 카운트)
-                return {
-                    entries: allEntries.filter(e => !toDelete.has(getSafeKey(e))),
-                    deleted: toDelete.size
-                };
+                return { entries: allEntries.filter(e => !toDelete.has(getSafeKey(e))), deleted: toDelete.size };
             }
             return { entries: allEntries, deleted: 0 };
         };
 
+        // ═══════════════════════════════════════════════════════════
         // Public API
+        // ═══════════════════════════════════════════════════════════
         return {
             CONFIG,
             getSafeKey,
@@ -814,8 +687,9 @@
             calcRecency,
             EmbeddingEngine,
             EmotionEngine,
-            SafeEvaluator,
+            LLMProcessor,
             TokenizerEngine,
+            formatMemories,
 
             rebuildIndex: (lorebook) => {
                 _log("Rebuilding Hash Index...");
@@ -841,10 +715,7 @@
                 const candidates = MemoryState.hashIndex.get(idxKey) || new Set();
                 const map = new Map(existingList.map(e => [getSafeKey(e), e]));
 
-                const checkPool = [
-                    ...Array.from(candidates).map(k => map.get(k)).filter(Boolean),
-                    ...existingList.slice(-5)
-                ];
+                const checkPool = [...Array.from(candidates).map(k => map.get(k)).filter(Boolean), ...existingList.slice(-5)];
                 const uniqueCheck = new Set(checkPool);
 
                 for (const item of uniqueCheck) {
@@ -856,55 +727,92 @@
                 return false;
             },
 
-            // ═══════════════════════════════════════════════════════
-            // [FIX-1] prepareMemory - GC 결과 반영 및 원본 업데이트
-            // ═══════════════════════════════════════════════════════
+            // ═══════════════════════════════════════════════════════════
+            // [v4.0] prepareMemory - LLM Processing Integration
+            // ═══════════════════════════════════════════════════════════
             prepareMemory: async (data, currentTurn, existingList, lorebook, char, chat) => {
-                const { content, importance } = data;
-                if (!content || content.length < 5) return null;
+                const { userMsg, aiResponse } = data;
 
-                // 조기 GC 체크
+                if (!userMsg && !aiResponse) return null;
+
+                // 1. LLM으로 기억 처리
+                let processed;
+                if (CONFIG.useLLM) {
+                    processed = await LLMProcessor.processMemory(userMsg || '', aiResponse || '', CONFIG);
+                } else {
+                    // 폴백
+                    processed = {
+                        shouldSave: true,
+                        summary: `[사용자] ${userMsg?.slice(0, 50) || 'N/A'}... [응답] ${aiResponse?.slice(0, 50) || 'N/A'}...`,
+                        facts: [],
+                        importance: 5,
+                        category: 'personal',
+                        entities: [],
+                        sentiment: 'neutral'
+                    };
+                }
+
+                // 2. 저장 가치가 없으면 리턴
+                if (!processed.shouldSave) {
+                    _log("LLM decided not to save this memory");
+                    return null;
+                }
+
+                // 3. GC 체크
                 const managed = MemoryEngine.getManagedEntries(lorebook);
                 if (managed.length >= Math.floor(CONFIG.maxLimit * 0.95)) {
-                    _log(`Early GC triggered: ${managed.length}/${CONFIG.maxLimit}`);
-
-                    // [FIX-1] GC 실행 및 결과 받기
+                    _log(`Early GC: ${managed.length}/${CONFIG.maxLimit}`);
                     const gcResult = MemoryEngine.incrementalGC(lorebook, currentTurn);
 
-                    // [FIX-1] 삭제된 항목이 있으면 원본 lorebook 업데이트
                     if (gcResult.deleted > 0) {
                         _log(`GC removed ${gcResult.deleted} entries`);
-
-                        // lorebook 배열 직접 업데이트 (RisuAI 방식)
                         lorebook.length = 0;
                         lorebook.push(...gcResult.entries);
-
-                        // 인덱스 재구축
                         MemoryEngine.rebuildIndex(lorebook);
-
-                        // [FIX-1] 캐릭터 상태 저장
                         if (char && chat !== undefined) {
                             MemoryEngine.setLorebook(char, chat, lorebook);
                         }
                     }
                 }
 
-                // 중복 체크는 업데이트된 lorebook 기준으로
+                // 4. 중복 체크 (요약 기준)
+                const summaryText = processed.summary || userMsg || '';
                 const updatedList = lorebook || existingList;
-                if (await MemoryEngine.checkDuplication(content, updatedList)) return null;
+                if (await MemoryEngine.checkDuplication(summaryText, updatedList)) {
+                    _log("Duplicate memory detected");
+                    return null;
+                }
 
-                const imp = importance || 5;
+                // 5. 메타데이터 생성
+                const imp = processed.importance || 5;
                 const ttl = imp >= 9 ? -1 : 30;
-                const meta = { t: currentTurn, ttl, imp };
+                const meta = {
+                    t: currentTurn,
+                    ttl,
+                    imp,
+                    cat: processed.category || 'personal',
+                    ent: processed.entities || [],
+                    summary: processed.summary || '',
+                    sentiment: processed.sentiment || 'neutral'
+                };
 
-                const idxKey = TokenizerEngine.getIndexKey(content);
+                // 6. 내용 구성
+                let contentStr = '';
+                if (processed.facts && processed.facts.length > 0) {
+                    contentStr = processed.facts.map(f => `[사실] ${f}`).join('\n');
+                } else {
+                    contentStr = summaryText;
+                }
+
+                // 7. 인덱스 등록
+                const idxKey = TokenizerEngine.getIndexKey(contentStr);
                 if (!MemoryState.hashIndex.has(idxKey)) MemoryState.hashIndex.set(idxKey, new Set());
-                MemoryState.hashIndex.get(idxKey).add(TokenizerEngine.getSafeMapKey(content));
+                MemoryState.hashIndex.get(idxKey).add(TokenizerEngine.getSafeMapKey(contentStr));
 
                 return {
                     key: "",
                     comment: CONFIG.loreComment,
-                    content: `[META:${JSON.stringify(meta)}]\n${content}\n`,
+                    content: `[META:${JSON.stringify(meta)}]\n${contentStr}\n`,
                     mode: "normal",
                     insertorder: 100,
                     alwaysActive: true
@@ -939,7 +847,6 @@
                     .slice(0, topK);
             },
 
-            // [FIX-1] 외부에서도 호출 가능하도록 노출
             incrementalGC,
 
             getLorebook: (char, chat) =>
@@ -951,35 +858,180 @@
             },
 
             getManagedEntries: (lorebook) =>
-                (Array.isArray(lorebook) ? lorebook : [])
-                    .filter(e => e.comment === CONFIG.loreComment),
+                (Array.isArray(lorebook) ? lorebook : []).filter(e => e.comment === CONFIG.loreComment),
 
-            getCacheStats: () => ({
-                meta: getMetaCache().stats,
-                sim: getSimCache().stats
-            }),
+            getCacheStats: () => ({ meta: getMetaCache().stats, sim: getSimCache().stats }),
 
-            getState: () => ({ ...MemoryState })
+            getState: () => ({ ...MemoryState }),
+
+            incrementTurn: () => { MemoryState.currentTurn++; return MemoryState.currentTurn; },
+            getCurrentTurn: () => MemoryState.currentTurn,
+            setTurn: (turn) => { MemoryState.currentTurn = turn; }
         };
     })();
 
     // ══════════════════════════════════════════════════════════════
-    // [MAIN] Initialization
+    // [TRIGGER] RisuAI Event Handlers
     // ══════════════════════════════════════════════════════════════
-    const safeModify = async (f) => {
-        await loreLock.writeLock();
-        try {
-            const c = await risuai.getCharacter();
-            const copy = typeof structuredClone === 'function'
-                ? structuredClone(c)
-                : JSON.parse(JSON.stringify(c));
-            const r = await f(copy);
-            return r ? await risuai.setCharacter(r) : false;
-        } finally {
-            loreLock.writeUnlock();
+    const writeMutex = { locked: false, queue: [] };
+
+    const acquireLock = async () => {
+        return new Promise(resolve => {
+            if (!writeMutex.locked) {
+                writeMutex.locked = true;
+                resolve();
+            } else {
+                writeMutex.queue.push(resolve);
+            }
+        });
+    };
+
+    const releaseLock = () => {
+        if (writeMutex.queue.length > 0) {
+            const next = writeMutex.queue.shift();
+            next();
+        } else {
+            writeMutex.locked = false;
         }
     };
 
+    // ══════════════════════════════════════════════════════════════
+    // GENERATE_BEFORE - Memory Inject
+    // ══════════════════════════════════════════════════════════════
+    if (typeof risuai !== 'undefined' && risuai.registerTrigger) {
+        risuai.registerTrigger('GENERATE_BEFORE', async (data) => {
+            try {
+                const char = await risuai.getCharacter();
+                if (!char) return data;
+
+                const chat = char.chats?.[char.chatPage];
+                if (!chat) return data;
+
+                const lore = MemoryEngine.getLorebook(char, chat);
+                const candidates = MemoryEngine.getManagedEntries(lore);
+
+                if (candidates.length === 0) return data;
+
+                const userMessage = data.messages?.[data.messages.length - 1]?.content || '';
+                const query = userMessage.slice(0, 500);
+
+                const memories = await MemoryEngine.retrieveMemories(
+                    query,
+                    MemoryEngine.getCurrentTurn(),
+                    candidates,
+                    {},
+                    10
+                );
+
+                if (memories.length === 0) return data;
+
+                const memoryText = MemoryEngine.formatMemories(memories);
+
+                if (data.prompt) {
+                    data.prompt = data.prompt + '\n\n' + memoryText;
+                } else if (data.messages) {
+                    data.messages.unshift({ role: 'system', content: memoryText });
+                }
+
+                if (MemoryEngine.CONFIG.debug) {
+                    console.log(`[LMAI] Injected ${memories.length} memories`);
+                }
+
+                return data;
+            } catch (e) {
+                console.error('[LMAI] GENERATE_BEFORE Error:', e?.message || e);
+                return data;
+            }
+        });
+
+        // ══════════════════════════════════════════════════════════════
+        // GENERATE_AFTER - Memory Save with LLM Processing
+        // ══════════════════════════════════════════════════════════════
+        risuai.registerTrigger('GENERATE_AFTER', async (data) => {
+            try {
+                const char = await risuai.getCharacter();
+                if (!char) return data;
+
+                const chat = char.chats?.[char.chatPage];
+                if (!chat) return data;
+
+                MemoryEngine.incrementTurn();
+
+                const userMsg = data.userMessage || '';
+                const aiResponse = data.reply || data.response || '';
+
+                if (!userMsg && !aiResponse) return data;
+
+                const lore = MemoryEngine.getLorebook(char, chat);
+
+                await acquireLock();
+                try {
+                    // v4.0: LLM 처리된 기억 저장
+                    const newMemory = await MemoryEngine.prepareMemory(
+                        { userMsg, aiResponse },
+                        MemoryEngine.getCurrentTurn(),
+                        lore,
+                        lore,
+                        char,
+                        chat
+                    );
+
+                    if (newMemory) {
+                        lore.push(newMemory);
+                        MemoryEngine.setLorebook(char, chat, lore);
+                        await risuai.setCharacter(char);
+
+                        if (MemoryEngine.CONFIG.debug) {
+                            console.log(`[LMAI] Saved memory (Turn: ${MemoryEngine.getCurrentTurn()})`);
+                        }
+                    }
+                } finally {
+                    releaseLock();
+                }
+
+                return data;
+            } catch (e) {
+                console.error('[LMAI] GENERATE_AFTER Error:', e?.message || e);
+                return data;
+            }
+        });
+
+        // CHAT_START
+        risuai.registerTrigger('CHAT_START', async (data) => {
+            try {
+                const char = await risuai.getCharacter();
+                if (!char) return data;
+
+                const chat = char.chats?.[char.chatPage];
+                if (!chat) return data;
+
+                const lore = MemoryEngine.getLorebook(char, chat);
+                const managed = MemoryEngine.getManagedEntries(lore);
+
+                let maxTurn = 0;
+                for (const entry of managed) {
+                    const meta = MemoryEngine.getCachedMeta(entry);
+                    if (meta.t > maxTurn) maxTurn = meta.t;
+                }
+
+                MemoryEngine.setTurn(maxTurn + 1);
+                MemoryEngine.rebuildIndex(lore);
+
+                if (MemoryEngine.CONFIG.debug) {
+                    console.log(`[LMAI] Chat started. Turn: ${MemoryEngine.getCurrentTurn()}, Memories: ${managed.length}`);
+                }
+
+                return data;
+            } catch (e) {
+                console.error('[LMAI] CHAT_START Error:', e?.message || e);
+                return data;
+            }
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // [MAIN] Initialization
+    // ══════════════════════════════════════════════════════════════
     const updateConfigFromArgs = async () => {
         const cfg = MemoryEngine.CONFIG;
         let local = {};
@@ -993,9 +1045,7 @@
         const getVal = (key, argName, type, parent = null, fallback = undefined) => {
             const localVal = parent ? local[parent]?.[key] : local[key];
             let argVal;
-            if (argName) {
-                try { argVal = risuai.getArgument(argName); } catch { }
-            }
+            if (argName) { try { argVal = risuai.getArgument(argName); } catch { } }
             const configVal = parent ? cfg[parent]?.[key] : cfg[key];
 
             const raw = localVal !== undefined ? localVal
@@ -1017,40 +1067,27 @@
             }
         };
 
-        cfg.maxLimit = getVal('maxLimit', 'max_limit', 'number', null, 150);
+        cfg.maxLimit = getVal('maxLimit', 'max_limit', 'number', null, 200);
         cfg.threshold = getVal('threshold', 'threshold', 'number', null, 5);
         cfg.simThreshold = getVal('simThreshold', 'sim_threshold', 'number', null, 0.25);
         cfg.debug = getVal('debug', 'debug', 'boolean', null, false);
-        cfg.cbsEnabled = getVal('cbsEnabled', 'cbs_enabled', 'boolean', null, true);
-        cfg.emotionEnabled = getVal('emotionEnabled', 'emotion_enabled', 'boolean', null, true);
+        cfg.useLLM = getVal('useLLM', 'use_llm', 'boolean', null, true);
+        cfg.injectionTemplate = getVal('injectionTemplate', 'injection_template', 'string', null, '[관련 기억]\n{{memories}}\n[/관련 기억]');
 
         cfg.mainModel = {
-            url: getVal('url', null, 'string', 'mainModel', ''),
-            key: getVal('key', null, 'string', 'mainModel', ''),
-            model: getVal('model', null, 'string', 'mainModel', '')
+            url: getVal('url', 'main_url', 'string', 'mainModel', ''),
+            key: getVal('key', 'main_key', 'string', 'mainModel', ''),
+            model: getVal('model', 'main_model', 'string', 'mainModel', 'gpt-4o-mini'),
+            temp: getVal('temp', 'main_temp', 'number', 'mainModel', 0.3)
         };
         cfg.embedModel = {
-            url: getVal('url', null, 'string', 'embedModel', ''),
-            key: getVal('key', null, 'string', 'embedModel', ''),
-            model: getVal('model', null, 'string', 'embedModel', 'text-embedding-3-small')
+            url: getVal('url', 'embed_url', 'string', 'embedModel', ''),
+            key: getVal('key', 'embed_key', 'string', 'embedModel', ''),
+            model: getVal('model', 'embed_model', 'string', 'embedModel', 'text-embedding-3-small')
         };
 
         const mode = (getVal('weightMode', 'weight_mode', 'string', null, 'auto')).toLowerCase();
         cfg.weightMode = mode;
-
-        const manualWeights = {
-            similarity: getVal('w_sim', 'w_sim', 'number', null, 0.5),
-            importance: getVal('w_imp', 'w_imp', 'number', null, 0.3),
-            recency: getVal('w_rec', 'w_rec', 'number', null, 0.2)
-        };
-
-        const weightSum = Object.values(manualWeights).reduce((a, b) => a + b, 0);
-        if (Math.abs(weightSum - 1.0) > 0.01 && weightSum > 0) {
-            manualWeights.similarity /= weightSum;
-            manualWeights.importance /= weightSum;
-            manualWeights.recency /= weightSum;
-            if (cfg.debug) console.log(`[LMAI] Weights normalized`);
-        }
 
         const PRESETS = {
             romance: { similarity: 0.5, importance: 0.3, recency: 0.2 },
@@ -1061,15 +1098,18 @@
 
         if (PRESETS[mode]) {
             cfg.weights = PRESETS[mode];
-            if (cfg.debug) console.log(`[LMAI] Preset: ${mode.toUpperCase()}`);
         } else {
-            cfg.weights = manualWeights;
+            cfg.weights = {
+                similarity: getVal('w_sim', 'w_sim', 'number', null, 0.5),
+                importance: getVal('w_imp', 'w_imp', 'number', null, 0.3),
+                recency: getVal('w_rec', 'w_rec', 'number', null, 0.2)
+            };
         }
     };
 
     // Initialize
     try {
-        console.log('[LMAI] v3.7.1 Initializing...');
+        console.log('[LMAI] v4.0 Pro Initializing...');
         await updateConfigFromArgs();
 
         if (typeof risuai !== 'undefined') {
@@ -1080,7 +1120,7 @@
         }
 
         MemoryState.isInitialized = true;
-        console.log(`[LMAI] v3.7.1 Ready. Mode=${MemoryEngine.CONFIG.weightMode} | Debug=${MemoryEngine.CONFIG.debug}`);
+        console.log(`[LMAI] v4.0 Pro Ready. LLM=${MemoryEngine.CONFIG.useLLM} | Mode=${MemoryEngine.CONFIG.weightMode}`);
     } catch (e) {
         console.error("[LMAI] Init Error:", e?.message || e, e?.stack);
     }
