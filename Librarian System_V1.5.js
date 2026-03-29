@@ -294,7 +294,7 @@
                 const controller = new AbortController();
                 const timeout = setTimeout(() => controller.abort(), config.llm.timeout || 15000);
 
-                const response = await risuai.fetch(config.llm.url, {
+                const response = await risuai.nativeFetch(config.llm.url, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1054,9 +1054,7 @@
         const _log = (msg) => { if (CONFIG.debug) console.log(`[LMAI] ${msg}`); };
         const getSafeKey = (entry) => entry.id || TokenizerEngine.getSafeMapKey(entry.content || "");
 
-        const META_PATTERN = /
-$$META:(\{[^}]+\})$$
-/;
+        const META_PATTERN = /\[META:(\{[^}]+\})\]/;
         const parseMeta = (raw) => {
             const def = { t: 0, ttl: 0, imp: 5, type: 'context', cat: 'personal', ent: [] };
             if (typeof raw !== 'string') return def;
@@ -1114,7 +1112,7 @@ $$META:(\{[^}]+\})$$
                         const controller = new AbortController();
                         const timeout = setTimeout(() => controller.abort(), 15000);
                         try {
-                            const res = await risuai.fetch(m.url, {
+                            const res = await risuai.nativeFetch(m.url, {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json', 'Authorization':`Bearer ${m.key}` },
                                 body: JSON.stringify({ input: [text], model: m.model }),
@@ -1467,11 +1465,6 @@ $$META:(\{[^}]+\})$$
     // ══════════════════════════════════════════════════════════════
     // [PROCESSOR] World Adjustment Manager
     // ══════════════════════════════════════════════════════════════
-    const WorldAdjustmentManager = (() => {
-        const analyzeUserIntent = (userMessage, conflictInfo) => {
-            const text = userMessage.toLowerCase();
-            const explicitChangePatterns = [/사실은
-// [PROCESSOR] World Adjustment Manager (계속)
 const WorldAdjustmentManager = (() => {
     const analyzeUserIntent = (userMessage, conflictInfo) => {
         const text = userMessage.toLowerCase();
@@ -1679,26 +1672,51 @@ const releaseLock = () => {
     else writeMutex.locked = false;
 };
 
-// GENERATE_BEFORE
-if (typeof risuai !== 'undefined' && risuai.registerTrigger) {
-    risuai.registerTrigger('GENERATE_BEFORE', async (data) => {
+// 마지막 사용자 메시지 캐시 (beforeRequest → afterRequest 전달용)
+let _lastUserMessage = '';
+
+// 지연 초기화 (CHAT_START 대체 - beforeRequest 최초 호출 시 실행)
+const _lazyInit = async (lore) => {
+    if (MemoryState.isInitialized) return;
+    MemoryEngine.rebuildIndex(lore);
+    EntityManager.rebuildCache(lore);
+    HierarchicalWorldManager.loadWorldGraph(lore);
+    const managed = MemoryEngine.getManagedEntries(lore);
+    let maxTurn = 0;
+    for (const entry of managed) {
+        const meta = MemoryEngine.getCachedMeta(entry);
+        if (meta.t > maxTurn) maxTurn = meta.t;
+    }
+    MemoryEngine.setTurn(maxTurn + 1);
+    MemoryState.isInitialized = true;
+    if (MemoryEngine.CONFIG.debug) {
+        console.log(`[LMAI] Lazy init. Turn: ${MemoryEngine.getCurrentTurn()}, Memories: ${managed.length}`);
+        console.log(`[LMAI] Entities: ${EntityManager.getEntityCache().size}, Relations: ${EntityManager.getRelationCache().size}`);
+    }
+};
+
+if (typeof risuai !== 'undefined') {
+    // beforeRequest: OpenAI 메시지 배열에 컨텍스트 주입
+    risuai.addRisuReplacer('beforeRequest', async (messages, type) => {
         try {
             const char = await risuai.getCharacter();
-            if (!char) return data;
+            if (!char) return messages;
 
             const chat = char.chats?.[char.chatPage];
-            if (!chat) return data;
+            if (!chat) return messages;
 
             const lore = MemoryEngine.getLorebook(char, chat);
 
-            // 캐시 초기화
+            // 지연 초기화
+            await _lazyInit(lore);
+
             HierarchicalWorldManager.loadWorldGraph(lore);
             if (EntityManager.getEntityCache().size === 0) {
                 EntityManager.rebuildCache(lore);
             }
 
-            const userMessage = data.messages?.[data.messages.length - 1]?.content || '';
-            const originalPrompt = data.prompt || '';
+            const userMessage = messages.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
+            _lastUserMessage = userMessage;
 
             // 언급된 엔티티 찾기
             const mentionedEntities = [];
@@ -1732,55 +1750,53 @@ if (typeof risuai !== 'undefined' && risuai.registerTrigger) {
             );
             const memoryText = MemoryEngine.formatMemories(memories);
 
-            // 프롬프트 구성
-            const promptParts = [];
+            // 컨텍스트 구성
+            const contextParts = [];
+            if (worldPrompt) contextParts.push(worldPrompt);
+            if (entityPrompt) contextParts.push('[인물 정보]\n' + entityPrompt);
+            if (relationPrompt) contextParts.push('[관계 정보]\n' + relationPrompt);
+            if (memories.length > 0) contextParts.push('[관련 기억]\n' + memoryText);
+            contextParts.push('[지시사항]\n1. 위 세계관 규칙을 준수하세요.\n2. 존재하지 않는 요소(마법, 기, 레벨 등)는 언급하지 마세요.\n3. 인물 정보를 일관되게 유지하세요.');
 
-            if (originalPrompt.includes('[System]')) {
-                promptParts.push(originalPrompt);
+            if (contextParts.length === 0) return messages;
+            const contextStr = contextParts.join('\n\n');
+
+            // 시스템 메시지에 컨텍스트 주입
+            const result = messages.map(m => ({ ...m }));
+            const sysIdx = result.findIndex(m => m.role === 'system');
+            if (sysIdx >= 0) {
+                result[sysIdx].content = result[sysIdx].content + '\n\n' + contextStr;
             } else {
-                promptParts.push('[System]\n당신은 AI 캐릭터입니다. 세계관과 캐릭터 정보를 바탕으로 일관되게 대화하세요.');
+                result.unshift({ role: 'system', content: contextStr });
             }
-
-            if (worldPrompt) promptParts.push('\n' + worldPrompt);
-            if (entityPrompt) promptParts.push('\n[인물 정보]\n' + entityPrompt);
-            if (relationPrompt) promptParts.push('\n[관계 정보]\n' + relationPrompt);
-            if (memories.length > 0) promptParts.push('\n[관련 기억]\n' + memoryText);
-
-            // 지시사항
-            promptParts.push('\n[지시사항]');
-            promptParts.push('1. 위 세계관 규칙을 준수하세요.');
-            promptParts.push('2. 존재하지 않는 요소(마법, 기, 레벨 등)는 언급하지 마세요.');
-            promptParts.push('3. 인물 정보를 일관되게 유지하세요.');
-
-            data.prompt = promptParts.join('\n');
 
             if (MemoryEngine.CONFIG.debug) {
                 console.log('[LMAI] World:', HierarchicalWorldManager.getActivePath());
                 console.log('[LMAI] Entities:', mentionedEntities.length);
             }
 
-            return data;
+            return result;
         } catch (e) {
-            console.error('[LMAI] GENERATE_BEFORE Error:', e?.message || e);
-            return data;
+            console.error('[LMAI] beforeRequest Error:', e?.message || e);
+            return messages;
         }
     });
 
-    // GENERATE_AFTER
-    risuai.registerTrigger('GENERATE_AFTER', async (data) => {
+    // afterRequest: 기억 저장 및 엔티티 업데이트
+    risuai.addRisuReplacer('afterRequest', async (content, type) => {
         try {
             const char = await risuai.getCharacter();
-            if (!char) return data;
+            if (!char) return content;
 
             const chat = char.chats?.[char.chatPage];
-            if (!chat) return data;
+            if (!chat) return content;
 
             MemoryEngine.incrementTurn();
 
-            const userMsg = data.userMessage || '';
-            const aiResponse = data.reply || data.response || '';
+            const userMsg = _lastUserMessage;
+            const aiResponse = content;
 
-            if (!userMsg && !aiResponse) return data;
+            if (!userMsg && !aiResponse) return content;
 
             const lore = MemoryEngine.getLorebook(char, chat);
             const config = MemoryEngine.CONFIG;
@@ -1832,12 +1848,8 @@ if (typeof risuai !== 'undefined' && risuai.registerTrigger) {
                 profile.global.multiverse = true;
                 profile.global.dimensionTravel = true;
             }
-            if (complexAnalysis.indicators.timeTravel) {
-                profile.global.timeTravel = true;
-            }
-            if (complexAnalysis.indicators.metaNarrative) {
-                profile.global.metaNarrative = true;
-            }
+            if (complexAnalysis.indicators.timeTravel) profile.global.timeTravel = true;
+            if (complexAnalysis.indicators.metaNarrative) profile.global.metaNarrative = true;
 
             // 엔티티 정보 추출
             const storedInfo = EntityAwareProcessor.formatStoredInfo();
@@ -1846,22 +1858,19 @@ if (typeof risuai !== 'undefined' && risuai.registerTrigger) {
             );
 
             if (entityResult.success) {
-                // 세계관 일관성 검사
-                const currentRules = HierarchicalWorldManager.getCurrentRules();
                 for (const entityData of entityResult.entities || []) {
                     if (!entityData.name) continue;
                     const consistency = EntityManager.checkConsistency(entityData.name, entityData);
                     if (!consistency.consistent && config.debug) {
-                        console.warn(`[LMAI] Entity consistency warning:`, consistency.conflicts);
+                        console.warn('[LMAI] Entity consistency warning:', consistency.conflicts);
                     }
                 }
-
                 await EntityAwareProcessor.applyExtractions(entityResult, lore, config);
             }
 
             // 일반 기억 저장
             const newMemory = await MemoryEngine.prepareMemory(
-                { content:`[사용자] ${userMsg}\n[응답] ${aiResponse}`, importance: 5 },
+                { content: `[사용자] ${userMsg}\n[응답] ${aiResponse}`, importance: 5 },
                 MemoryEngine.getCurrentTurn(), lore, lore, char, chat
             );
 
@@ -1870,52 +1879,14 @@ if (typeof risuai !== 'undefined' && risuai.registerTrigger) {
                 MemoryEngine.setLorebook(char, chat, lore);
             }
 
-            // 저장
+            // 저장 (EntityManager.saveToLorebook 내부에서 setCharacter 호출)
             await HierarchicalWorldManager.saveWorldGraph(char, chat, lore);
             await EntityManager.saveToLorebook(char, chat, lore);
-            await risuai.setCharacter(char);
 
-            return data;
+            return content;
         } catch (e) {
-            console.error('[LMAI] GENERATE_AFTER Error:', e?.message || e);
-            return data;
-        }
-    });
-
-    // CHAT_START
-    risuai.registerTrigger('CHAT_START', async (data) => {
-        try {
-            const char = await risuai.getCharacter();
-            if (!char) return data;
-
-            const chat = char.chats?.[char.chatPage];
-            if (!chat) return data;
-
-            const lore = MemoryEngine.getLorebook(char, chat);
-
-            // 캐시 재구축
-            MemoryEngine.rebuildIndex(lore);
-            EntityManager.rebuildCache(lore);
-            HierarchicalWorldManager.loadWorldGraph(lore);
-
-            // 턴 동기화
-            const managed = MemoryEngine.getManagedEntries(lore);
-            let maxTurn = 0;
-            for (const entry of managed) {
-                const meta = MemoryEngine.getCachedMeta(entry);
-                if (meta.t > maxTurn) maxTurn = meta.t;
-            }
-            MemoryEngine.setTurn(maxTurn + 1);
-
-            if (MemoryEngine.CONFIG.debug) {
-                console.log(`[LMAI] Chat started. Turn: ${MemoryEngine.getCurrentTurn()}, Memories: ${managed.length}`);
-                console.log(`[LMAI] Entities: ${EntityManager.getEntityCache().size}, Relations: ${EntityManager.getRelationCache().size}`);
-            }
-
-            return data;
-        } catch (e) {
-            console.error('[LMAI] CHAT_START Error:', e?.message || e);
-            return data;
+            console.error('[LMAI] afterRequest Error:', e?.message || e);
+            return content;
         }
     });
 }
@@ -2019,6 +1990,538 @@ const updateConfigFromArgs = async () => {
         console.error("[LMAI] Init Error:", e?.message || e);
     }
 })();
+
+// ══════════════════════════════════════════════════════════════
+// [GUI] Librarian System UI
+// ══════════════════════════════════════════════════════════════
+const LMAI_GUI = (() => {
+    const GUI_CSS = `
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#1a1a2e;--bg2:#16213e;--bg3:#0f3460;--accent:#533483;--accent2:#6a44a0;--text:#e0e0e0;--text2:#a0a0b0;--border:#2a2a4a;--success:#2ecc71;--danger:#e74c3c;--radius:8px}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;display:flex;flex-direction:column}
+.hdr{background:var(--bg2);border-bottom:1px solid var(--border);padding:10px 14px;display:flex;align-items:center;gap:10px;flex-shrink:0}
+.hdr h1{font-size:15px;font-weight:600;white-space:nowrap}
+.tabs{display:flex;gap:3px;background:var(--bg);border-radius:var(--radius);padding:3px;flex:1}
+.tb{flex:1;padding:5px 8px;border:none;background:transparent;color:var(--text2);cursor:pointer;border-radius:6px;font-size:12px;transition:all .2s}
+.tb:hover{background:var(--bg3);color:var(--text)}
+.tb.on{background:var(--accent);color:#fff}
+.xbtn{background:transparent;border:none;color:var(--text2);cursor:pointer;font-size:17px;padding:3px 8px;border-radius:var(--radius);transition:all .2s}
+.xbtn:hover{background:var(--danger);color:#fff}
+.content{flex:1;overflow:hidden}
+.panel{display:none;height:100%;overflow-y:auto;padding:14px}
+.panel.on{display:block}
+.toolbar{display:flex;gap:7px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+input,select,textarea{background:var(--bg2);border:1px solid var(--border);color:var(--text);padding:5px 9px;border-radius:var(--radius);font-size:13px;outline:none;transition:border-color .2s}
+input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
+.si{flex:1;min-width:150px}
+.stat{font-size:12px;color:var(--text2);white-space:nowrap}
+.list{display:flex;flex-direction:column;gap:7px}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:11px;transition:border-color .2s}
+.card:hover{border-color:var(--accent2)}
+.card-hdr{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:7px;gap:8px}
+.card-meta{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:5px}
+.bdg{font-size:11px;padding:2px 7px;border-radius:10px;font-weight:500;white-space:nowrap}
+.bh{background:#2d4a2d;color:#5dbb5d}
+.bm{background:#4a3d1a;color:#c89c1a}
+.bl{background:#2a2a2a;color:#888}
+.bt{background:var(--bg3);color:var(--text2)}
+.body{font-size:12px;color:var(--text2);line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.acts{display:flex;gap:5px;flex-shrink:0}
+.btn{padding:4px 9px;border:none;border-radius:var(--radius);font-size:12px;cursor:pointer;transition:all .2s}
+.bp{background:var(--accent);color:#fff}.bp:hover{background:var(--accent2)}
+.bd{background:transparent;border:1px solid var(--danger);color:var(--danger)}.bd:hover{background:var(--danger);color:#fff}
+.sec{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin:14px 0 7px;border-bottom:1px solid var(--border);padding-bottom:5px}
+.sec:first-child{margin-top:0}
+.sgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:580px){.sgrid{grid-template-columns:1fr}}
+.ss{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
+.ss h3{font-size:12px;margin-bottom:10px;color:var(--text2)}
+.fld{display:flex;flex-direction:column;gap:3px;margin-bottom:9px}
+.fld label{font-size:11px;color:var(--text2)}
+.fld input,.fld select,.fld textarea{width:100%}
+.tr{display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)}
+.tr:last-child{border-bottom:none}
+.tr label{font-size:13px}
+.tog{position:relative;width:34px;height:19px}
+.tog input{opacity:0;width:0;height:0}
+.tsl{position:absolute;top:0;left:0;right:0;bottom:0;background:var(--border);border-radius:19px;cursor:pointer;transition:.2s}
+.tsl:before{content:'';position:absolute;width:15px;height:15px;left:2px;bottom:2px;background:#fff;border-radius:50%;transition:.2s}
+.tog input:checked+.tsl{background:var(--accent)}
+.tog input:checked+.tsl:before{transform:translateX(15px)}
+.wt{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:10px;margin-bottom:10px;min-height:60px}
+.wn{display:flex;align-items:center;gap:7px;padding:5px 8px;border-radius:var(--radius);cursor:pointer;transition:background .2s}
+.wn:hover{background:var(--bg3)}
+.wn.cur{background:var(--accent)}
+.wn-name{font-size:13px}
+.wn-layer{font-size:11px;color:var(--text2)}
+.sbar{position:sticky;bottom:0;background:var(--bg2);border-top:1px solid var(--border);padding:9px 14px;display:flex;gap:7px}
+.toast{position:fixed;bottom:65px;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;padding:7px 18px;border-radius:18px;font-size:13px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999;white-space:nowrap}
+.toast.on{opacity:1}
+.ec{width:100%;background:var(--bg);border:1px solid transparent;color:var(--text);padding:3px 5px;border-radius:4px;font-size:12px;line-height:1.5;resize:none;transition:border-color .2s}
+.ec:focus{border-color:var(--accent2);outline:none}
+.rw{display:flex;gap:7px;align-items:center}
+.rw input[type=range]{flex:1;accent-color:var(--accent)}
+.rv{min-width:28px;text-align:right;font-size:12px;color:var(--text2)}
+.empty{text-align:center;color:var(--text2);font-size:13px;padding:30px 0}
+.cs{display:flex;gap:10px;flex-wrap:wrap;margin-top:7px}
+.ci{background:var(--bg3);padding:5px 11px;border-radius:var(--radius);font-size:12px;color:var(--text2)}
+`;
+
+    const GUI_BODY = `
+<div class="hdr">
+  <h1>&#128218; Librarian System</h1>
+  <div class="tabs">
+    <button class="tb on" data-tab="memory">&#128218; &#47700;&#47784;&#47532;</button>
+    <button class="tb" data-tab="entity">&#128100; &#50656;&#54000;&#54000;</button>
+    <button class="tb" data-tab="world">&#127757; &#49464;&#44228;&#44288;</button>
+    <button class="tb" data-tab="settings">&#9881; &#49444;&#51221;</button>
+  </div>
+  <button class="xbtn" id="xbtn">&#10005;</button>
+</div>
+<div class="content">
+  <div id="tab-memory" class="panel on">
+    <div class="toolbar">
+      <input type="text" id="ms" class="si" placeholder="&#128269; &#47700;&#47784;&#47532; &#44160;&#49353;...">
+      <select id="mf">
+        <option value="all">&#51204;&#52404; &#51473;&#50836;&#46020;</option>
+        <option value="h">&#45192;&#51020; (7+)</option>
+        <option value="m">&#51473;&#44036; (4-6)</option>
+        <option value="l">&#45212;&#51020; (1-3)</option>
+      </select>
+      <span class="stat">&#52509; <strong id="mc">0</strong>&#44060;</span>
+      <button class="btn bp" onclick="saveAllMemories()">&#128190; &#51200;&#51109;</button>
+    </div>
+    <div id="ml" class="list"></div>
+  </div>
+  <div id="tab-entity" class="panel">
+    <div class="sec">&#128101; &#51064;&#47932; &#47785;&#47197;</div>
+    <div id="el" class="list"></div>
+    <div class="sec">&#129309; &#44288;&#44228; &#47785;&#47197;</div>
+    <div id="rl" class="list"></div>
+    <div class="sbar">
+      <button class="btn bp" onclick="saveEntities()">&#128190; &#51200;&#51109;</button>
+    </div>
+  </div>
+  <div id="tab-world" class="panel">
+    <div class="sec">&#128506; &#49464;&#44228;&#44288; &#53944;&#47532;</div>
+    <div id="wt" class="wt"></div>
+    <div class="sec">&#127760; &#51204;&#50669; &#44592;&#45733;</div>
+    <div class="wt">
+      <div class="tr"><label>&#47785;&#54000;&#48260;&#49828;</label><label class="tog"><input type="checkbox" id="w1"><span class="tsl"></span></label></div>
+      <div class="tr"><label>&#52264;&#50896; &#51060;&#46041;</label><label class="tog"><input type="checkbox" id="w2"><span class="tsl"></span></label></div>
+      <div class="tr"><label>&#49884;&#44036; &#50668;&#54665;</label><label class="tog"><input type="checkbox" id="w3"><span class="tsl"></span></label></div>
+      <div class="tr"><label>&#47700;&#53440; &#49436;&#51221;</label><label class="tog"><input type="checkbox" id="w4"><span class="tsl"></span></label></div>
+    </div>
+    <div class="sec">&#128203; &#54788;&#51116; &#49464;&#44228; &#44508;&#52825;</div>
+    <div id="wr" class="wt" style="font-size:12px"></div>
+    <div class="sbar"><button class="btn bp" onclick="saveWorld()">&#128190; &#49464;&#44228;&#44288; &#51200;&#51109;</button></div>
+  </div>
+  <div id="tab-settings" class="panel">
+    <div class="sgrid">
+      <div class="ss">
+        <h3>&#129302; LLM &#49444;&#51221;</h3>
+        <div class="fld"><label>Provider</label><select id="slp"><option>openai</option><option>custom</option></select></div>
+        <div class="fld"><label>URL</label><input type="text" id="slu" placeholder="https://api.openai.com/v1/chat/completions"></div>
+        <div class="fld"><label>API Key</label><input type="password" id="slk" placeholder="sk-..."></div>
+        <div class="fld"><label>Model</label><input type="text" id="slm" placeholder="gpt-4o-mini"></div>
+        <div class="fld"><label>Temperature</label><div class="rw"><input type="range" id="slt" min="0" max="1" step="0.1" oninput="document.getElementById('sltv').textContent=this.value"><span id="sltv" class="rv">0.3</span></div></div>
+        <div class="fld"><label>Timeout (ms)</label><input type="number" id="slto" placeholder="15000"></div>
+        <div class="tr"><label>LLM &#49324;&#50857;</label><label class="tog"><input type="checkbox" id="sul"><span class="tsl"></span></label></div>
+      </div>
+      <div class="ss">
+        <h3>&#129504; Embedding &#49444;&#51221;</h3>
+        <div class="fld"><label>Provider</label><select id="sep"><option>openai</option><option>custom</option></select></div>
+        <div class="fld"><label>URL</label><input type="text" id="seu" placeholder="https://api.openai.com/v1/embeddings"></div>
+        <div class="fld"><label>API Key</label><input type="password" id="sek" placeholder="sk-..."></div>
+        <div class="fld"><label>Model</label><input type="text" id="sem" placeholder="text-embedding-3-small"></div>
+      </div>
+      <div class="ss">
+        <h3>&#128190; &#47700;&#47784;&#47532; &#49444;&#51221;</h3>
+        <div class="fld"><label>&#52572;&#45824; &#47700;&#47784;&#47532; &#49688;</label><input type="number" id="sml" placeholder="200"></div>
+        <div class="fld"><label>&#51473;&#50836;&#46020; &#51076;&#44228;&#44049;</label><input type="number" id="sth" placeholder="5"></div>
+        <div class="fld"><label>&#50976;&#49324;&#46020; &#51076;&#44228;&#44049;</label><div class="rw"><input type="range" id="sst" min="0" max="1" step="0.05" oninput="document.getElementById('sstv').textContent=parseFloat(this.value).toFixed(2)"><span id="sstv" class="rv">0.25</span></div></div>
+        <div class="fld"><label>GC &#48176;&#52824; &#53356;&#44592;</label><input type="number" id="sgc" placeholder="5"></div>
+      </div>
+      <div class="ss">
+        <h3>&#9878; &#44032;&#51473;&#52824; &amp; &#47784;&#46300;</h3>
+        <div class="fld"><label>&#44032;&#51473;&#52824; &#47784;&#46300;</label>
+          <select id="swm" onchange="toggleCW()">
+            <option value="auto">&#51088;&#46041; (&#51109;&#47476; &#44048;&#51648;)</option>
+            <option value="romance">&#47196;&#47564;&#49828;</option>
+            <option value="action">&#50529;&#49496;</option>
+            <option value="mystery">&#48120;&#49828;&#53552;&#47532;</option>
+            <option value="daily">&#51068;&#49345;</option>
+            <option value="custom">&#52964;&#49828;&#53364;</option>
+          </select>
+        </div>
+        <div id="cw" style="display:none">
+          <div class="fld"><label>&#50976;&#49324;&#46020; <span id="wsv" class="rv">0.50</span></label><input type="range" id="sws" min="0" max="1" step="0.05" oninput="document.getElementById('wsv').textContent=parseFloat(this.value).toFixed(2)"></div>
+          <div class="fld"><label>&#51473;&#50836;&#46020; <span id="wiv" class="rv">0.30</span></label><input type="range" id="swi" min="0" max="1" step="0.05" oninput="document.getElementById('wiv').textContent=parseFloat(this.value).toFixed(2)"></div>
+          <div class="fld"><label>&#52572;&#49888;&#49457; <span id="wrv" class="rv">0.20</span></label><input type="range" id="swr" min="0" max="1" step="0.05" oninput="document.getElementById('wrv').textContent=parseFloat(this.value).toFixed(2)"></div>
+        </div>
+        <div class="fld"><label>&#49464;&#44228;&#44288; &#51312;&#51221; &#47784;&#46300;</label>
+          <select id="sam">
+            <option value="dynamic">&#45796;&#51060;&#45236;&#48048; (&#47589;&#46973; &#44592;&#48152;)</option>
+            <option value="soft">&#49548;&#54532;&#53944; (&#51088;&#46041; &#51312;&#51221;)</option>
+            <option value="hard">&#54616;&#46300; (&#50629;&#44201; &#44144;&#48512;)</option>
+          </select>
+        </div>
+        <div class="tr"><label>&#46356;&#48260;&#44536; &#47784;&#46300;</label><label class="tog"><input type="checkbox" id="sdb"><span class="tsl"></span></label></div>
+      </div>
+    </div>
+    <div class="sec">&#128202; &#52884;&#49884; &#53685;&#44228;</div>
+    <div id="cst" class="cs"></div>
+    <div class="sbar">
+      <button class="btn bp" onclick="saveSettings()">&#128190; &#49444;&#51221; &#51200;&#51329;</button>
+      <button class="btn bd" onclick="resetSettings()">&#128260; &#52488;&#44592;&#54868;</button>
+    </div>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+`;
+
+    const buildHTML = (memoriesJSON, entitiesJSON, relationsJSON, worldJSON, configJSON) => {
+        const scriptLogic = [
+            'function esc(s){var d=document.createElement("div");d.appendChild(document.createTextNode(s||""));return d.innerHTML;}',
+            'function toast(m,d){var t=document.getElementById("toast");t.textContent=m;t.classList.add("on");setTimeout(function(){t.classList.remove("on");},d||2000);}',
+            'function parseMeta(c){var m=(c||"").match(/\\[META:(\\{[^}]+\\})\]/);if(!m)return{imp:5,t:0,ttl:0,cat:""};try{return JSON.parse(m[1]);}catch(e){return{imp:5,t:0,ttl:0,cat:""};}}',
+            'function stripMeta(c){return(c||"").replace(/\\[META:\\{[^}]+\\}\\]/g,"").trim();}',
+            'function impBdg(i){var cls=i>=7?"bh":i>=4?"bm":"bl";return"<span class=\\"bdg "+cls+"\\">&#51473;&#50836;&#46020; "+i+"</span>";}',
+            'function switchTab(n){document.querySelectorAll(".panel").forEach(function(p){p.classList.remove("on");});document.querySelectorAll(".tb").forEach(function(b){b.classList.remove("on");if(b.dataset.tab===n)b.classList.add("on");});document.getElementById("tab-"+n).classList.add("on");}',
+            'document.getElementById("xbtn").onclick=function(){try{risuai.hideContainer();}catch(e){}};',
+            'document.querySelectorAll(".tb").forEach(function(b){b.onclick=function(){switchTab(this.dataset.tab);};});',
+
+            // --- MEMORY TAB ---
+            'var _mems=[].concat(_MEM);',
+            'function renderMems(list){',
+            '  var c=document.getElementById("ml");',
+            '  document.getElementById("mc").textContent=list.length;',
+            '  if(!list.length){c.innerHTML="<div class=\\"empty\\">&#51200;&#51109;&#46108; &#47700;&#47784;&#47532;&#44032; &#50630;&#49845;&#45768;&#45796;</div>";return;}',
+            '  c.innerHTML=list.map(function(m,i){',
+            '    var meta=parseMeta(m.content);',
+            '    var content=stripMeta(m.content);',
+            '    var idx=_MEM.indexOf(m);',
+            '    var ttl=meta.ttl===-1?"&#50689;&#44396;":(meta.ttl||0)+"turn";',
+            '    return "<div class=\\"card\\" id=\\"mc-"+idx+"\\">"',
+            '      +"<div class=\\"card-hdr\\"><div class=\\"card-meta\\">"+impBdg(meta.imp||5)',
+            '      +"<span class=\\"bdg bt\\">&#53134; "+(meta.t||0)+"</span>"',
+            '      +"<span class=\\"bdg bt\\">TTL:"+ttl+"</span>"',
+            '      +(meta.cat?"<span class=\\"bdg bt\\">"+esc(meta.cat)+"</span>":"")',
+            '      +"</div><div class=\\"acts\\"><button class=\\"btn bp\\" onclick=\\"saveMemory("+idx+")\\" >&#51200;&#51109;</button>"',
+            '      +"<button class=\\"btn bd\\" onclick=\\"delMem("+idx+")\\" >&#49325;&#51228;</button></div></div>"',
+            '      +"<textarea class=\\"ec\\" id=\\"mt-"+idx+"\\" rows=\\"3\\">"+esc(content)+"</textarea>"',
+            '      +"<div style=\\"display:flex;gap:7px;align-items:center;margin-top:5px\\">"',
+            '      +"<label style=\\"font-size:11px;color:var(--text2)\\">&#51473;&#50836;&#46020;:</label>"',
+            '      +"<input type=\\"number\\" id=\\"mi-"+idx+"\\" min=\\"1\\" max=\\"10\\" value=\\""+(meta.imp||5)+"\\" style=\\"width:55px\\">"',
+            '      +"</div></div>";',
+            '  }).join("");',
+            '}',
+            'function filterMems(){',
+            '  var q=document.getElementById("ms").value.toLowerCase();',
+            '  var f=document.getElementById("mf").value;',
+            '  var res=_MEM.filter(function(m){',
+            '    var meta=parseMeta(m.content);',
+            '    var c=stripMeta(m.content).toLowerCase();',
+            '    var mq=!q||c.indexOf(q)>=0;',
+            '    var mf=f==="h"?(meta.imp||5)>=7:f==="m"?((meta.imp||5)>=4&&(meta.imp||5)<7):f==="l"?(meta.imp||5)<4:true;',
+            '    return mq&&mf;',
+            '  });',
+            '  renderMems(res);',
+            '}',
+            'document.getElementById("ms").oninput=filterMems;',
+            'document.getElementById("mf").onchange=filterMems;',
+            'function saveMemory(idx){',
+            '  var nc=document.getElementById("mt-"+idx).value;',
+            '  var ni=parseInt(document.getElementById("mi-"+idx).value)||5;',
+            '  var meta=parseMeta(_MEM[idx].content);',
+            '  meta.imp=Math.max(1,Math.min(10,ni));',
+            '  _MEM[idx].content="[META:"+JSON.stringify(meta)+"]\\n"+nc;',
+            '  toast("&#9989; &#47700;&#47784;&#47532; &#49688;&#51221;&#46428;");',
+            '}',
+            'function delMem(idx){',
+            '  if(!confirm("&#51060; &#47700;&#47784;&#47532;&#47484; &#49325;&#51228;&#54616;&#49884;&#44192;&#49845;&#45768;&#44620;?"))return;',
+            '  _MEM.splice(idx,1);filterMems();toast("&#128465; &#47700;&#47784;&#47532;&#44032; &#49325;&#51228;&#46428;");',
+            '}',
+            'function saveAllMemories(){',
+            '  var lore=[];',
+            '  _MEM.forEach(function(m){lore.push({key:m.key||"",comment:"lmai_memory",content:m.content,mode:"normal",insertorder:100,alwaysActive:true});});',
+            '  _ENT.forEach(function(e){lore.push(e);});',
+            '  _REL.forEach(function(r){lore.push(r);});',
+            '  if(_WLD)lore.unshift({key:"world_graph",comment:"lmai_world_graph",content:JSON.stringify(_WLD),mode:"normal",insertorder:1,alwaysActive:true});',
+            '  saveLoreToChar(lore,function(){toast("&#128190; &#47700;&#47784;&#47532; &#51200;&#51209;&#46428;");});',
+            '}',
+
+            // --- ENTITY TAB ---
+            'function renderEnts(){',
+            '  var ec=document.getElementById("el");',
+            '  if(!_ENT.length){ec.innerHTML="<div class=\\"empty\\">&#52628;&#51201;&#46108; &#51064;&#47932;&#51060; &#50630;&#49845;&#45768;&#45796;</div>";}',
+            '  else ec.innerHTML=_ENT.map(function(e,i){',
+            '    var d={};try{d=JSON.parse(e.content);}catch(x){}',
+            '    var feats=(d.appearance&&d.appearance.features||[]).join(", ");',
+            '    var traits=(d.personality&&d.personality.traits||[]).join(", ");',
+            '    var occ=(d.background&&d.background.occupation)||"";',
+            '    var loc=(d.status&&d.status.currentLocation)||"";',
+            '    return "<div class=\\"card\\"><div class=\\"card-hdr\\"><strong>"+esc(d.name||e.key||"?")+"</strong>"',
+            '      +"<div class=\\"acts\\"><button class=\\"btn bd\\" onclick=\\"delEnt("+i+")\\" >&#49325;&#51228;</button></div></div>"',
+            '      +"<div class=\\"card-meta\\">"+(occ?"<span class=\\"bdg bt\\">&#51649;&#50629;: "+esc(occ)+"</span>":"")',
+            '      +(loc?"<span class=\\"bdg bt\\">&#50948;&#52824;: "+esc(loc)+"</span>":"")',
+            '      +"</div>"+(feats?"<div class=\\"body\\">&#50808;&#47784;: "+esc(feats)+"</div>":"")',
+            '      +(traits?"<div class=\\"body\\" style=\\"margin-top:3px\\">&#49457;&#44201;: "+esc(traits)+"</div>":"")',
+            '      +"</div>";',
+            '  }).join("");',
+            '  var rc=document.getElementById("rl");',
+            '  if(!_REL.length){rc.innerHTML="<div class=\\"empty\\">&#52628;&#51201;&#46108; &#44288;&#44228;&#44032; &#50630;&#49845;&#45768;&#45796;</div>";}',
+            '  else rc.innerHTML=_REL.map(function(r,i){',
+            '    var d={};try{d=JSON.parse(r.content);}catch(x){}',
+            '    var cls=((d.details&&d.details.closeness)||0*100).toFixed(0);',
+            '    var trs=((d.details&&d.details.trust)||0*100).toFixed(0);',
+            '    return "<div class=\\"card\\"><div class=\\"card-hdr\\"><strong>"+esc(d.entityA||"?")+" &#8596; "+esc(d.entityB||"?")+"</strong>"',
+            '      +"<div class=\\"acts\\"><button class=\\"btn bd\\" onclick=\\"delRel("+i+")\\" >&#49325;&#51228;</button></div></div>"',
+            '      +"<div class=\\"card-meta\\"><span class=\\"bdg bt\\">"+esc(d.relationType||"&#44288;&#44228;")+"</span>"',
+            '      +"<span class=\\"bdg bt\\">&#52828;&#48128;&#46020; "+cls+"%</span>"',
+            '      +"<span class=\\"bdg bt\\">&#49888;&#47728;&#46020; "+trs+"%</span></div>"',
+            '      +(d.sentiments&&d.sentiments.fromAtoB?"<div class=\\"body\\">"+esc(d.entityA)+" → "+esc(d.entityB)+": "+esc(d.sentiments.fromAtoB)+"</div>":"")',
+            '      +"</div>";',
+            '  }).join("");',
+            '}',
+            'function delEnt(i){if(!confirm("&#51060; &#51064;&#47932; &#45936;&#51060;&#53552;&#47484; &#49325;&#51228;&#54616;&#49884;&#44192;&#49845;&#45768;&#44620;?"))return;_ENT.splice(i,1);renderEnts();toast("&#128465; &#49325;&#51228;&#46428;");}',
+            'function delRel(i){if(!confirm("&#51060; &#44288;&#44228; &#45936;&#51060;&#53552;&#47484; &#49325;&#51228;&#54616;&#49884;&#44192;&#49845;&#45768;&#44620;?"))return;_REL.splice(i,1);renderEnts();toast("&#128465; &#49325;&#51228;&#46428;");}',
+            'function saveEntities(){',
+            '  var lore=[];',
+            '  _MEM.forEach(function(m){lore.push(m);});',
+            '  _ENT.forEach(function(e){lore.push(e);});',
+            '  _REL.forEach(function(r){lore.push(r);});',
+            '  if(_WLD)lore.unshift({key:"world_graph",comment:"lmai_world_graph",content:JSON.stringify(_WLD),mode:"normal",insertorder:1,alwaysActive:true});',
+            '  saveLoreToChar(lore,function(){toast("&#128190; &#51200;&#51329;&#46428;");});',
+            '}',
+
+            // --- WORLD TAB ---
+            'function renderWorld(){',
+            '  var tc=document.getElementById("wt");',
+            '  var rc=document.getElementById("wr");',
+            '  if(!_WLD||!_WLD.nodes||!_WLD.nodes.length){tc.innerHTML="<div class=\\"empty\\">&#49464;&#44228;&#44288; &#45936;&#51060;&#53552;&#44032; &#50630;&#49845;&#45768;&#45796;</div>";return;}',
+            '  var ap=_WLD.activePath||[];',
+            '  function rn(id,depth){',
+            '    var entry=null;',
+            '    for(var j=0;j<_WLD.nodes.length;j++){if(_WLD.nodes[j][0]===id){entry=_WLD.nodes[j][1];break;}}',
+            '    if(!entry)return"";',
+            '    var active=ap.indexOf(id)>=0;',
+            '    var ind=depth*14;',
+            '    var h="<div class=\\"wn"+(active?" cur":"")+"\" style=\\"padding-left:"+(10+ind)+"px\\">"',
+            '      +(depth>0?"&#9492; ":"")+"<span class=\\"wn-name\\">"+esc(entry.name)+"</span>"',
+            '      +"<span class=\\"wn-layer\\">["+esc(entry.layer||"dim")+"]</span>"',
+            '      +(active?"<span class=\\"bdg bh\\" style=\\"margin-left:4px\\">&#54788;&#51116;</span>":"")+"</div>";',
+            '    var ch=entry.children||[];',
+            '    for(var k=0;k<ch.length;k++)h+=rn(ch[k],depth+1);',
+            '    return h;',
+            '  }',
+            '  tc.innerHTML=_WLD.rootId?rn(_WLD.rootId,0):_WLD.nodes.map(function(n){return"<div class=\\"wn\\"><span class=\\"wn-name\\">"+esc((n[1]||{}).name||"?")+"</span></div>";}).join("");',
+            '  var g=_WLD.global||{};',
+            '  document.getElementById("w1").checked=!!g.multiverse;',
+            '  document.getElementById("w2").checked=!!g.dimensionTravel;',
+            '  document.getElementById("w3").checked=!!g.timeTravel;',
+            '  document.getElementById("w4").checked=!!g.metaNarrative;',
+            '  var lid=ap[ap.length-1];',
+            '  var cn=null;',
+            '  if(lid){for(var n=0;n<_WLD.nodes.length;n++){if(_WLD.nodes[n][0]===lid){cn=_WLD.nodes[n][1];break;}}}',
+            '  if(cn&&cn.rules){',
+            '    var r=cn.rules;var ex=r.exists||{};var sys=r.systems||{};var itms=[];',
+            '    if(ex.magic)itms.push("&#47560;&#48277; &#10003;");',
+            '    if(ex.ki)itms.push("&#44592;(&#27668;) &#10003;");',
+            '    if(ex.supernatural)itms.push("&#52488;&#51088;&#50672; &#10003;");',
+            '    if(sys.leveling)itms.push("&#47808;&#48292;&#47553; &#10003;");',
+            '    if(sys.skills)itms.push("&#49828;&#53688; &#10003;");',
+            '    if(sys.stats)itms.push("&#49828;&#53588; &#10003;");',
+            '    if(ex.technology)itms.push("&#44592;&#49696;: "+esc(ex.technology));',
+            '    rc.innerHTML=itms.length?itms.map(function(i){return"<span class=\\"bdg bt\\" style=\\"display:inline-block;margin:2px\\">"+i+"</span>";}).join(""):"<span style=\\"color:var(--text2)\\">&#44508;&#52825; &#50630;&#51020;</span>";',
+            '  }',
+            '}',
+            'function saveWorld(){',
+            '  if(!_WLD)return;',
+            '  _WLD.global=_WLD.global||{};',
+            '  _WLD.global.multiverse=document.getElementById("w1").checked;',
+            '  _WLD.global.dimensionTravel=document.getElementById("w2").checked;',
+            '  _WLD.global.timeTravel=document.getElementById("w3").checked;',
+            '  _WLD.global.metaNarrative=document.getElementById("w4").checked;',
+            '  var lore=[];',
+            '  lore.unshift({key:"world_graph",comment:"lmai_world_graph",content:JSON.stringify(_WLD),mode:"normal",insertorder:1,alwaysActive:true});',
+            '  _MEM.forEach(function(m){lore.push(m);});',
+            '  _ENT.forEach(function(e){lore.push(e);});',
+            '  _REL.forEach(function(r){lore.push(r);});',
+            '  saveLoreToChar(lore,function(){toast("&#128190; &#49464;&#44228;&#44288; &#51200;&#51329;&#46428;");renderWorld();});',
+            '}',
+
+            // --- SETTINGS TAB ---
+            'function loadSettings(){',
+            '  var c=_CFG;',
+            '  document.getElementById("slp").value=(c.llm&&c.llm.provider)||"openai";',
+            '  document.getElementById("slu").value=(c.llm&&c.llm.url)||"";',
+            '  document.getElementById("slk").value=(c.llm&&c.llm.key)||"";',
+            '  document.getElementById("slm").value=(c.llm&&c.llm.model)||"gpt-4o-mini";',
+            '  var t=document.getElementById("slt");t.value=(c.llm&&c.llm.temp)||0.3;document.getElementById("sltv").textContent=t.value;',
+            '  document.getElementById("slto").value=(c.llm&&c.llm.timeout)||15000;',
+            '  document.getElementById("sul").checked=!!c.useLLM;',
+            '  document.getElementById("sep").value=(c.embed&&c.embed.provider)||"openai";',
+            '  document.getElementById("seu").value=(c.embed&&c.embed.url)||"";',
+            '  document.getElementById("sek").value=(c.embed&&c.embed.key)||"";',
+            '  document.getElementById("sem").value=(c.embed&&c.embed.model)||"text-embedding-3-small";',
+            '  document.getElementById("sml").value=c.maxLimit||200;',
+            '  document.getElementById("sth").value=c.threshold||5;',
+            '  var s=document.getElementById("sst");s.value=c.simThreshold||0.25;document.getElementById("sstv").textContent=parseFloat(s.value).toFixed(2);',
+            '  document.getElementById("sgc").value=c.gcBatchSize||5;',
+            '  document.getElementById("swm").value=c.weightMode||"auto";toggleCW();',
+            '  if(c.weightMode==="custom"&&c.weights){',
+            '    document.getElementById("sws").value=c.weights.similarity||0.5;document.getElementById("wsv").textContent=parseFloat(c.weights.similarity||0.5).toFixed(2);',
+            '    document.getElementById("swi").value=c.weights.importance||0.3;document.getElementById("wiv").textContent=parseFloat(c.weights.importance||0.3).toFixed(2);',
+            '    document.getElementById("swr").value=c.weights.recency||0.2;document.getElementById("wrv").textContent=parseFloat(c.weights.recency||0.2).toFixed(2);',
+            '  }',
+            '  document.getElementById("sam").value=c.worldAdjustmentMode||"dynamic";',
+            '  document.getElementById("sdb").checked=!!c.debug;',
+            '  var cs=document.getElementById("cst");',
+            '  var st=c._cacheStats||{};',
+            '  cs.innerHTML="<div class=\\"ci\\">&#47700;&#47784;&#47532;: "+(c._memCount||0)+"</div>"',
+            '    +"<div class=\\"ci\\">&#51064;&#47932;: "+(c._entCount||0)+"</div>"',
+            '    +"<div class=\\"ci\\">&#44288;&#44228;: "+(c._relCount||0)+"</div>"',
+            '    +(st.meta?"<div class=\\"ci\\">&#47700;&#53440;&#52884;&#49884; &#55176;&#53944;&#50984;: "+(parseFloat(st.meta.hitRate)*100||0).toFixed(1)+"%</div>":"")',
+            '    +(st.sim?"<div class=\\"ci\\">&#50976;&#49324;&#46020;&#52884;&#49884;: "+st.sim.size+"</div>":"");',
+            '}',
+            'function toggleCW(){var m=document.getElementById("swm").value;document.getElementById("cw").style.display=m==="custom"?"block":"none";}',
+            'function saveSettings(){',
+            '  var sim=parseFloat(document.getElementById("sws").value)||0.5;',
+            '  var imp=parseFloat(document.getElementById("swi").value)||0.3;',
+            '  var rec=parseFloat(document.getElementById("swr").value)||0.2;',
+            '  var sum=sim+imp+rec;if(Math.abs(sum-1)>0.01&&sum>0){sim/=sum;imp/=sum;rec/=sum;}',
+            '  var cfg={',
+            '    useLLM:document.getElementById("sul").checked,',
+            '    debug:document.getElementById("sdb").checked,',
+            '    maxLimit:parseInt(document.getElementById("sml").value)||200,',
+            '    threshold:parseInt(document.getElementById("sth").value)||5,',
+            '    simThreshold:parseFloat(document.getElementById("sst").value)||0.25,',
+            '    gcBatchSize:parseInt(document.getElementById("sgc").value)||5,',
+            '    weightMode:document.getElementById("swm").value,',
+            '    worldAdjustmentMode:document.getElementById("sam").value,',
+            '    llm:{provider:document.getElementById("slp").value,url:document.getElementById("slu").value,key:document.getElementById("slk").value,model:document.getElementById("slm").value,temp:parseFloat(document.getElementById("slt").value)||0.3,timeout:parseInt(document.getElementById("slto").value)||15000},',
+            '    embed:{provider:document.getElementById("sep").value,url:document.getElementById("seu").value,key:document.getElementById("sek").value,model:document.getElementById("sem").value}',
+            '  };',
+            '  if(cfg.weightMode==="custom")cfg.weights={similarity:sim,importance:imp,recency:rec};',
+            '  risuai.pluginStorage.setItem("LMAI_Config",JSON.stringify(cfg)).then(function(){toast("&#128190; &#49444;&#51221; &#51200;&#51329;&#46428;");}).catch(function(e){toast("&#10060; &#51200;&#51329; &#49892;&#54168;");});',
+            '}',
+            'function resetSettings(){',
+            '  if(!confirm("&#47784;&#46304; &#49444;&#51221;&#51012; &#52488;&#44592;&#44049;&#51004;&#47196; &#46020;&#46028;&#47532;&#49884;&#44192;&#49845;&#45768;&#44620;?"))return;',
+            '  _CFG={useLLM:true,debug:false,maxLimit:200,threshold:5,simThreshold:0.25,gcBatchSize:5,weightMode:"auto",worldAdjustmentMode:"dynamic",llm:{provider:"openai",url:"",key:"",model:"gpt-4o-mini",temp:0.3,timeout:15000},embed:{provider:"openai",url:"",key:"",model:"text-embedding-3-small"}};',
+            '  loadSettings();toast("&#128260; &#49444;&#51221; &#52488;&#44592;&#54868;&#46428;");',
+            '}',
+
+            // --- SAVE LOREBOOK ---
+            'function saveLoreToChar(lore,cb){',
+            '  risuai.getCharacter().then(function(char){',
+            '    if(!char)return;',
+            '    var chat=char.chats&&char.chats[char.chatPage];',
+            '    if(Array.isArray(char.lorebook))char.lorebook=lore;',
+            '    else if(chat)chat.localLore=lore;',
+            '    risuai.setCharacter(char).then(function(){if(cb)cb();}).catch(function(e){toast("&#10060; &#51200;&#51329; &#49892;&#54168;");console.error("[LMAI]",e);});',
+            '  }).catch(function(e){toast("&#10060; &#51200;&#51329; &#49892;&#54168;");console.error("[LMAI]",e);});',
+            '}',
+
+            // --- INIT ---
+            'filterMems();renderEnts();renderWorld();loadSettings();'
+        ].join('\n');
+
+        return '<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><style>' +
+            GUI_CSS + '</style></head><body>' + GUI_BODY +
+            '<script>(function(){\nvar _MEM=' + memoriesJSON + ';\nvar _ENT=' + entitiesJSON +
+            ';\nvar _REL=' + relationsJSON + ';\nvar _WLD=' + worldJSON +
+            ';\nvar _CFG=' + configJSON + ';\n' + scriptLogic + '\n})();\x3c/script></body></html>';
+    };
+
+    const show = async () => {
+        if (typeof risuai === 'undefined') return;
+        try {
+            await risuai.showContainer('fullscreen');
+
+            const char = await risuai.getCharacter();
+            const chat = char?.chats?.[char.chatPage];
+            const lore = char ? (MemoryEngine.getLorebook(char, chat) || []) : [];
+
+            const memories = lore.filter(e => e.comment === 'lmai_memory');
+            const entities  = lore.filter(e => e.comment === 'lmai_entity');
+            const relations = lore.filter(e => e.comment === 'lmai_relation');
+            const worldEntry = lore.find(e => e.comment === 'lmai_world_graph');
+
+            let worldData = { nodes: [], activePath: [], global: {}, rootId: null };
+            try {
+                if (worldEntry) {
+                    const p = JSON.parse(worldEntry.content);
+                    worldData = {
+                        ...p,
+                        nodes: p.nodes instanceof Map
+                            ? Array.from(p.nodes.entries())
+                            : Array.isArray(p.nodes) ? p.nodes : Object.entries(p.nodes || {})
+                    };
+                } else {
+                    const profile = HierarchicalWorldManager.getProfile();
+                    if (profile) {
+                        worldData = {
+                            nodes: Array.from(profile.nodes.entries()),
+                            activePath: profile.activePath || [],
+                            global: profile.global || {},
+                            rootId: profile.rootId
+                        };
+                    }
+                }
+            } catch {}
+
+            let configData = { ...MemoryEngine.CONFIG };
+            try {
+                const saved = await risuai.pluginStorage.getItem('LMAI_Config');
+                if (saved) {
+                    const p = typeof saved === 'string' ? JSON.parse(saved) : saved;
+                    configData = { ...configData, ...p };
+                }
+            } catch {}
+            configData._cacheStats = MemoryEngine.getCacheStats();
+            configData._memCount = memories.length;
+            configData._entCount = entities.length;
+            configData._relCount = relations.length;
+
+            const html = buildHTML(
+                JSON.stringify(memories),
+                JSON.stringify(entities),
+                JSON.stringify(relations),
+                JSON.stringify(worldData),
+                JSON.stringify(configData)
+            );
+
+            document.open();
+            document.write(html);
+            document.close();
+        } catch (e) {
+            console.error('[LMAI] GUI Error:', e?.message || e);
+        }
+    };
+
+    return { show };
+})();
+
+// GUI 등록
+if (typeof risuai !== 'undefined') {
+    (async () => {
+        try {
+            await risuai.registerSetting('Librarian System', LMAI_GUI.show, '📚', 'html', 'lmai-settings');
+            await risuai.registerButton({
+                name: 'Librarian',
+                icon: '📚',
+                iconType: 'html',
+                location: 'action',
+                id: 'lmai-button'
+            }, LMAI_GUI.show);
+            console.log('[LMAI] GUI registered.');
+        } catch (e) {
+            console.warn('[LMAI] GUI registration failed:', e?.message || e);
+        }
+    })();
+}
+
 
 // Export
 if (typeof globalThis !== 'undefined') {
