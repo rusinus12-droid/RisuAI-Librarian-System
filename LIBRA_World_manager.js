@@ -2,7 +2,7 @@
 //@display-name LIBRA World Manager
 //@author rusinus12@gmail.com
 //@api 3.0
-//@version 2.4.1
+//@version 2.4.0
 
 (async () => {
     // ══════════════════════════════════════════════════════════════
@@ -5297,18 +5297,18 @@ const LMAI_GUI = (() => {
     const GUI_CSS = `
 *{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#1a1a2e;--bg2:#16213e;--bg3:#0f3460;--accent:#533483;--accent2:#6a44a0;--text:#e0e0e0;--text2:#a0a0b0;--border:#2a2a4a;--success:#2ecc71;--danger:#e74c3c;--radius:8px}
-.lmai-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;font-family:'Segoe UI',system-ui,sans-serif;color:var(--text)}
-.gui-wrap{width:100%;max-width:720px;height:85vh;background:var(--bg);border-radius:12px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.5)}
-.hdr{background:var(--bg2);border-bottom:1px solid var(--border);padding:10px 14px;display:flex;align-items:center;gap:10px;flex-shrink:0}
+.lmai-overlay{position:fixed;top:0;left:0;width:100%;height:100%;padding:16px;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;font-family:'Segoe UI',system-ui,sans-serif;color:var(--text);overflow:auto}
+.gui-wrap{width:min(100%,720px);max-height:calc(100vh - 32px);height:min(85vh,960px);background:var(--bg);border-radius:12px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.5)}
+.hdr{background:var(--bg2);border-bottom:1px solid var(--border);padding:10px 14px;display:flex;align-items:center;gap:10px;flex-shrink:0;flex-wrap:wrap}
 .hdr h1{font-size:15px;font-weight:600;white-space:nowrap;margin:0}
-.tabs{display:flex;gap:3px;background:var(--bg);border-radius:var(--radius);padding:3px;flex:1}
+.tabs{display:flex;gap:3px;background:var(--bg);border-radius:var(--radius);padding:3px;flex:1;min-width:0;overflow:auto}
 .tb{flex:1;padding:5px 8px;border:none;background:transparent;color:var(--text2);cursor:pointer;border-radius:6px;font-size:12px;transition:all .2s}
 .tb:hover{background:var(--bg3);color:var(--text)}
 .tb.on{background:var(--accent);color:#fff}
 .xbtn{background:transparent;border:none;color:var(--text2);cursor:pointer;font-size:17px;padding:3px 8px;border-radius:var(--radius);transition:all .2s}
 .xbtn:hover{background:var(--danger);color:#fff}
-.content{flex:1;overflow:hidden}
-.panel{display:none;height:100%;overflow-y:auto;padding:14px}
+.content{flex:1;overflow:hidden;min-height:0}
+.panel{display:none;height:100%;overflow-y:auto;padding:14px;min-height:0;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
 .panel.on{display:block}
 .toolbar{display:flex;gap:7px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
 input,select,textarea{background:var(--bg2);border:1px solid var(--border);color:var(--text);padding:5px 9px;border-radius:var(--radius);font-size:13px;outline:none;transition:border-color .2s}
@@ -5325,15 +5325,14 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
 .bm{background:#4a3d1a;color:#c89c1a}
 .bl{background:#2a2a2a;color:#888}
 .bt{background:var(--bg3);color:var(--text2)}
-.acts{display:flex;gap:5px;flex-shrink:0}
-.btn{padding:4px 9px;border:none;border-radius:var(--radius);font-size:12px;cursor:pointer;transition:all .2s}
+.acts{display:flex;gap:5px;flex-shrink:0;flex-wrap:wrap}
+.btn{padding:6px 10px;border:none;border-radius:var(--radius);font-size:12px;cursor:pointer;transition:all .2s;min-height:32px}
 .bp{background:var(--accent);color:#fff}.bp:hover{background:var(--accent2)}
 .bs{background:var(--success);color:#fff}.bs:hover{opacity:0.85}
 .bd{background:transparent;border:1px solid var(--danger);color:var(--danger)}.bd:hover{background:var(--danger);color:#fff}
 .sec{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin:14px 0 7px;border-bottom:1px solid var(--border);padding-bottom:5px}
 .sec:first-child{margin-top:0}
 .sgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-@media(max-width:780px){.sgrid{grid-template-columns:1fr}.gui-wrap{max-width:100%;height:100vh;border-radius:0}}
 .ss{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
 .ss h3{font-size:12px;margin-bottom:10px;color:var(--text2)}
 .fld{display:flex;flex-direction:column;gap:3px;margin-bottom:9px}
@@ -5354,7 +5353,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
 .wn.cur{background:var(--accent)}
 .wn-name{font-size:13px}
 .wn-layer{font-size:11px;color:var(--text2)}
-.sbar{position:sticky;bottom:0;background:var(--bg2);border-top:1px solid var(--border);padding:9px 14px;display:flex;gap:7px}
+.sbar{position:sticky;bottom:0;background:var(--bg2);border-top:1px solid var(--border);padding:9px 14px;display:flex;gap:7px;flex-wrap:wrap}
 .toast{position:fixed;bottom:65px;left:50%;transform:translateX(-50%);background:var(--accent);color:#fff;padding:7px 18px;border-radius:18px;font-size:13px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999;white-space:nowrap}
 .toast.on{opacity:1}
 .ec{width:100%;background:var(--bg);border:1px solid transparent;color:var(--text);padding:3px 5px;border-radius:4px;font-size:12px;line-height:1.5;resize:none;transition:border-color .2s}
@@ -5368,12 +5367,40 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
 .ef{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:5px}
 .add-form{background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:10px;margin-bottom:10px;display:none}
 .add-form.on{display:block}
+@media(max-width:780px){
+  .lmai-overlay{padding:0;align-items:stretch;justify-content:stretch}
+  .gui-wrap{width:100%;max-width:100%;height:100dvh;max-height:100dvh;border-radius:0}
+  .hdr{position:sticky;top:0;z-index:2;padding:10px 10px 8px}
+  .hdr h1{width:100%;white-space:normal;line-height:1.35}
+  .tabs{width:100%;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));overflow:visible}
+  .tb{font-size:11px;padding:8px 6px}
+  .xbtn{margin-left:auto}
+  .sgrid,.ef{grid-template-columns:1fr}
+  .toolbar{display:grid;grid-template-columns:1fr 1fr;align-items:stretch}
+  .toolbar > *{min-width:0}
+  .toolbar .si,.toolbar .stat{grid-column:1 / -1}
+  .toolbar .btn,.toolbar select,.toolbar input{width:100%}
+  .card-hdr{flex-direction:column;align-items:stretch}
+  .acts{width:100%;justify-content:flex-end}
+  .sbar > .btn{flex:1 1 100%}
+  .rw{flex-wrap:wrap}
+  .rv{min-width:36px}
+  .wt{min-height:72px}
+}
+@media(max-width:480px){
+  .tabs{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .panel{padding:10px}
+  .toolbar{grid-template-columns:1fr}
+  .toolbar .si,.toolbar .stat{grid-column:auto}
+  .acts{justify-content:stretch}
+  .acts .btn{flex:1 1 100%}
+}
     `;
 
     const GUI_BODY = `
 <div class="gui-wrap">
 <div class="hdr">
-  <h1>📚 LIBRA World Manager <span style="font-size:0.7rem; font-weight:normal; opacity:0.5;">v2.4.0</span></h1>
+  <h1>📚 LIBRA World Manager <span style="font-size:0.7rem; font-weight:normal; opacity:0.5;">v2.4.1</span></h1>
   <div class="tabs">
     <button class="tb on" data-tab="memory">📚 메모리</button>
     <button class="tb" data-tab="entity">👤 엔티티</button>
