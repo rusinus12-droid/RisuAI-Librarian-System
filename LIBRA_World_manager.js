@@ -2,7 +2,7 @@
 //@display-name LIBRA World Manager
 //@author rusinus12@gmail.com
 //@api 3.0
-//@version 2.4.0
+//@version 3.0.0
 
 (async () => {
     // ══════════════════════════════════════════════════════════════
@@ -22,6 +22,17 @@
         if (!chat) return [];
         return chat.msgs || chat.messages || chat.message || chat.log || chat.mes || chat.chat || [];
     };
+    const getComparableMessageText = (msg) => {
+        const roleHint = (msg?.role === 'user' || msg?.is_user) ? 'user' : 'ai';
+        return Utils.getNarrativeComparableText(Utils.getMessageText(msg), roleHint);
+    };
+    const stripLBDATA = (text) => {
+        if (!text) return '';
+        return String(text)
+            .replace(/---\s*\[LBDATA START\][\s\S]*?\[LBDATA END\]\s*---/gi, '')
+            .replace(/\[LBDATA START\][\s\S]*?\[LBDATA END\]/gi, '')
+            .trim();
+    };
 
     // ══════════════════════════════════════════════════════════════
     // [UTILITY] State Management
@@ -33,6 +44,7 @@
         simCache: null,
         sessionCache: new Map(),
         rollbackTracker: new Map(), // { msg_id: [lore_keys] }
+        pendingTurnCommits: new Map(), // { chat_id: pending turn payload }
         transientMissing: new Map(), // { msg_id: { since, reason } }
         currentSessionId: null,
         _activeChatId: null,
@@ -41,6 +53,8 @@
         isInitialized: false,
         currentTurn: 0,
         initVersion: 0,
+        refreshStabilizeUntil: 0,
+        refreshDeleteBlockUntil: 0,
 
         reset() {
             this.gcCursor = 0;
@@ -49,9 +63,142 @@
             this.simCache?.cache?.clear();
             this.sessionCache.clear();
             this.rollbackTracker.clear();
+            this.pendingTurnCommits.clear();
             this.transientMissing.clear();
             this.initVersion++;
+            this.refreshStabilizeUntil = 0;
+            this.refreshDeleteBlockUntil = 0;
         }
+    };
+
+    const REFRESH_STABILIZE_MS = 2500;
+    const REFRESH_DELETE_BLOCK_MS = 15000;
+    const enterRefreshRecoveryWindow = () => {
+        const now = Date.now();
+        MemoryState.refreshStabilizeUntil = Math.max(MemoryState.refreshStabilizeUntil || 0, now + REFRESH_STABILIZE_MS);
+        MemoryState.refreshDeleteBlockUntil = Math.max(MemoryState.refreshDeleteBlockUntil || 0, now + REFRESH_DELETE_BLOCK_MS);
+        MemoryState.transientMissing.clear();
+    };
+    const isRefreshStabilizing = () => Date.now() < (MemoryState.refreshStabilizeUntil || 0);
+    const isRefreshDeleteBlocked = () => Date.now() < (MemoryState.refreshDeleteBlockUntil || 0);
+    const getChatMemoryScopeKey = (chat) => String(chat?.id || '__global__');
+    const PENDING_FINALIZE_MIN_MS = 3500;
+    const PENDING_FINALIZE_REQUIRED_MATCHES = 2;
+    const PENDING_STALE_MS = 180000;
+    const UI_INTERACTION_BLOCK_MS = 1200;
+    const UI_INTERACTION_EVENTS = ['pointerdown', 'mousedown', 'touchstart', 'click', 'keydown'];
+    const LIBRA_UI_GUARD_CLEANUP_KEY = '__LIBRA_UI_GUARD_CLEANUP__';
+    const LIBRA_TURN_RECOVERY_TIMER_CLEANUP_KEY = '__LIBRA_TURN_RECOVERY_TIMER_CLEANUP__';
+    const COLD_START_SCOPE_PRESETS = {
+        all: 0,
+        partial_100: 100,
+        partial_300: 300
+    };
+    let uiInteractionHotUntil = 0;
+    let uiInteractionListenersBound = false;
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, Math.max(0, ms)));
+    const isLibraDebugEnabled = () => {
+        try {
+            return typeof MemoryEngine !== 'undefined' && !!MemoryEngine.CONFIG?.debug;
+        } catch {
+            return false;
+        }
+    };
+    function resolveColdStartHistoryLimit(preset, fallbackLimit = 100) {
+        const normalized = String(preset || '').toLowerCase();
+        if (Object.prototype.hasOwnProperty.call(COLD_START_SCOPE_PRESETS, normalized)) {
+            return COLD_START_SCOPE_PRESETS[normalized];
+        }
+        const parsedFallback = Number(fallbackLimit);
+        return Number.isFinite(parsedFallback) ? Math.max(0, parsedFallback) : 100;
+    }
+    const markUiInteractionHot = () => {
+        uiInteractionHotUntil = Math.max(uiInteractionHotUntil, Date.now() + UI_INTERACTION_BLOCK_MS);
+    };
+    const unbindUiInteractionGuards = () => {
+        if (typeof document !== 'undefined') {
+            UI_INTERACTION_EVENTS.forEach((eventName) => {
+                document.removeEventListener(eventName, markUiInteractionHot, true);
+            });
+        }
+        uiInteractionListenersBound = false;
+        if (typeof globalThis !== 'undefined' && globalThis[LIBRA_UI_GUARD_CLEANUP_KEY] === unbindUiInteractionGuards) {
+            delete globalThis[LIBRA_UI_GUARD_CLEANUP_KEY];
+        }
+    };
+    const bindUiInteractionGuards = () => {
+        if (typeof document === 'undefined') return;
+        const existingCleanup = typeof globalThis !== 'undefined' ? globalThis[LIBRA_UI_GUARD_CLEANUP_KEY] : null;
+        if (typeof existingCleanup === 'function' && existingCleanup !== unbindUiInteractionGuards) {
+            existingCleanup();
+        }
+        if (uiInteractionListenersBound) return;
+        uiInteractionListenersBound = true;
+        UI_INTERACTION_EVENTS.forEach((eventName) => {
+            document.addEventListener(eventName, markUiInteractionHot, true);
+        });
+        if (typeof globalThis !== 'undefined') {
+            globalThis[LIBRA_UI_GUARD_CLEANUP_KEY] = unbindUiInteractionGuards;
+        }
+    };
+    const resolveActiveChatContext = async (preferredChat = null) => {
+        try {
+            const char = await risuai.getCharacter();
+            const charIdx = typeof risuai.getCurrentCharacterIndex === 'function'
+                ? await risuai.getCurrentCharacterIndex()
+                : -1;
+            let chatIndex = typeof risuai.getCurrentChatIndex === 'function'
+                ? await risuai.getCurrentChatIndex()
+                : -1;
+            if (!char || charIdx < 0) return { char: char || null, charIdx: -1, chat: null, chatIndex: -1 };
+
+            const chats = Array.isArray(char?.chats) ? char.chats : [];
+            if (preferredChat?.id) {
+                const resolved = chats.findIndex(entry => String(entry?.id || '') === String(preferredChat.id));
+                if (resolved >= 0) chatIndex = resolved;
+            }
+            const chat = chats?.[chatIndex] || null;
+            return { char, charIdx, chat, chatIndex };
+        } catch {
+            return { char: null, charIdx: -1, chat: null, chatIndex: -1 };
+        }
+    };
+    const requireLoadedCharacter = async () => {
+        const char = await risuai.getCharacter();
+        if (!char) {
+            throw new LIBRAError('No character loaded', 'NO_CHAR');
+        }
+        return char;
+    };
+    const persistLoreToActiveChat = async (preferredChat, lore, opts = {}) => {
+        if (!Array.isArray(lore)) return { ok: false, reason: 'invalid_lore' };
+        const { saveCheckpoint = false } = opts;
+        bindUiInteractionGuards();
+        const delayMs = uiInteractionHotUntil - Date.now();
+        if (delayMs > 0) {
+            await sleep(delayMs + 50);
+        }
+        const ctx = await resolveActiveChatContext(preferredChat);
+        if (!ctx.char || !ctx.chat || ctx.charIdx < 0 || ctx.chatIndex < 0) {
+            return { ok: false, reason: 'missing_chat_context' };
+        }
+
+        const nextChat = cloneForMutation(ctx.chat);
+        nextChat.localLore = lore.map(entry => safeClone(entry));
+
+        if (typeof risuai.setChatToIndex === 'function') {
+            await risuai.setChatToIndex(ctx.charIdx, ctx.chatIndex, nextChat);
+        } else {
+            const nextChar = cloneForMutation(ctx.char);
+            nextChar.chats = Array.isArray(nextChar.chats) ? nextChar.chats : [];
+            nextChar.chats[ctx.chatIndex] = nextChat;
+            await risuai.setCharacter(nextChar);
+        }
+
+        if (saveCheckpoint) {
+            await RefreshCheckpointManager.saveCheckpoint(ctx.char, nextChat, lore);
+        }
+        return { ok: true, chat: nextChat, chatIndex: ctx.chatIndex, charIdx: ctx.charIdx };
     };
 
     // ══════════════════════════════════════════════════════════════
@@ -86,7 +233,18 @@
             });
         }
 
-        readUnlock() { this.readers--; this._next(); }
+        readUnlock() {
+            if (this.readers <= 0) {
+                this.readers = 0;
+                if (isLibraDebugEnabled()) {
+                    console.warn('[LIBRA][RWLock] readUnlock called with no active readers');
+                }
+                this._next();
+                return;
+            }
+            this.readers--;
+            this._next();
+        }
         writeUnlock() { this.writer = false; this._next(); }
 
         _next() {
@@ -127,11 +285,7 @@
         }
 
         _isDebugEnabled() {
-            try {
-                return typeof MemoryEngine !== 'undefined' && !!MemoryEngine.CONFIG?.debug;
-            } catch {
-                return false;
-            }
+            return isLibraDebugEnabled();
         }
 
         _now() {
@@ -157,7 +311,7 @@
                 this._log(`start ${item.name} | queued=${queuedFor}ms | active=${this.active}/${this.maxConcurrent} | pending=${this.queue.length}`);
                 Promise.resolve()
                     .then(item.task)
-                    .then(item.resolve, item.reject)
+                    .then(item.resolve)
                     .catch(item.reject)
                     .finally(() => {
                         const finishedAt = this._now();
@@ -185,6 +339,220 @@
     const MaintenanceLLMQueue = new AsyncTaskQueue(3, 'MaintenanceLLMQueue');
     const BackgroundMaintenanceQueue = new AsyncTaskQueue(1, 'BackgroundMaintenanceQueue');
     const runMaintenanceLLM = (task, name = 'maintenance-llm') => MaintenanceLLMQueue.enqueue(task, name);
+
+    const safeClone = (value) => {
+        if (value == null || typeof value !== 'object') return value;
+        try {
+            return typeof structuredClone === 'function' ? structuredClone(value) : JSON.parse(JSON.stringify(value));
+        } catch (cloneError) {
+            try {
+                return JSON.parse(JSON.stringify(value));
+            } catch (jsonError) {
+                if (isLibraDebugEnabled()) {
+                    console.warn('[LIBRA] safeClone failed; returning original reference', cloneError?.message || cloneError, jsonError?.message || jsonError);
+                }
+                return value;
+            }
+        }
+    };
+    const cloneForMutation = (value) => {
+        const cloned = safeClone(value);
+        if (cloned !== value || value == null || typeof value !== 'object') return cloned;
+        if (Array.isArray(value)) {
+            return value.map(item => safeClone(item));
+        }
+        return { ...value };
+    };
+
+    const extractJson = (text) => {
+        if (!text || typeof text !== 'string') return null;
+        const cleaned = Utils.stripLLMThinkingTags(text).trim();
+
+        const sanitizeJsonCandidate = (value) => String(value || '')
+            .replace(/^\uFEFF/, '')
+            .replace(/[“”]/g, '"')
+            .replace(/[‘’]/g, "'")
+            .replace(/,\s*([}\]])/g, '$1')
+            .trim();
+
+        const parseCandidate = (candidate) => {
+            const normalized = sanitizeJsonCandidate(candidate);
+            if (!normalized) return null;
+            try {
+                return JSON.parse(normalized);
+            } catch {
+                return null;
+            }
+        };
+
+        const findBalancedJsonObject = (source) => {
+            const raw = String(source || '');
+            let start = -1;
+            let depth = 0;
+            let inString = false;
+            let escaped = false;
+            for (let i = 0; i < raw.length; i++) {
+                const ch = raw[i];
+                if (start < 0) {
+                    if (ch === '{') {
+                        start = i;
+                        depth = 1;
+                    }
+                    continue;
+                }
+                if (inString) {
+                    if (escaped) {
+                        escaped = false;
+                    } else if (ch === '\\') {
+                        escaped = true;
+                    } else if (ch === '"') {
+                        inString = false;
+                    }
+                    continue;
+                }
+                if (ch === '"') {
+                    inString = true;
+                    continue;
+                }
+                if (ch === '{') depth += 1;
+                else if (ch === '}') {
+                    depth -= 1;
+                    if (depth === 0) return raw.slice(start, i + 1);
+                }
+            }
+            if (start >= 0 && depth > 0) return raw.slice(start);
+            return '';
+        };
+
+        const tryRepairTruncatedJson = (candidate) => {
+            let normalized = sanitizeJsonCandidate(candidate);
+            if (!normalized.startsWith('{')) return null;
+
+            let inString = false;
+            let escaped = false;
+            let braceDepth = 0;
+            let bracketDepth = 0;
+            for (let i = 0; i < normalized.length; i++) {
+                const ch = normalized[i];
+                if (inString) {
+                    if (escaped) escaped = false;
+                    else if (ch === '\\') escaped = true;
+                    else if (ch === '"') inString = false;
+                    continue;
+                }
+                if (ch === '"') inString = true;
+                else if (ch === '{') braceDepth += 1;
+                else if (ch === '}') braceDepth = Math.max(0, braceDepth - 1);
+                else if (ch === '[') bracketDepth += 1;
+                else if (ch === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+            }
+
+            if (inString) normalized += '"';
+            normalized += ']'.repeat(bracketDepth);
+            normalized += '}'.repeat(braceDepth);
+            normalized = normalized.replace(/,\s*([}\]])/g, '$1');
+            return parseCandidate(normalized);
+        };
+
+        const direct = parseCandidate(cleaned);
+        if (direct) return direct;
+
+        const codeBlock = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+        if (codeBlock) {
+            const parsedCodeBlock = parseCandidate(codeBlock[1]);
+            if (parsedCodeBlock) return parsedCodeBlock;
+            const balancedCodeBlock = findBalancedJsonObject(codeBlock[1]);
+            const repairedCodeBlock = parseCandidate(balancedCodeBlock) || tryRepairTruncatedJson(balancedCodeBlock);
+            if (repairedCodeBlock) return repairedCodeBlock;
+        }
+
+        const balanced = findBalancedJsonObject(cleaned);
+        return parseCandidate(balanced) || tryRepairTruncatedJson(balanced) || null;
+    };
+
+    const getEmbeddingDebugSnapshotSafe = () => {
+        let engine = null;
+        try {
+            engine = MemoryEngine?.EmbeddingEngine || null;
+        } catch {
+            engine = null;
+        }
+        if (!engine || typeof engine.getDebugSnapshot !== 'function') {
+            return {
+                totalCalls: 0,
+                cacheHits: 0,
+                providerCalls: 0,
+                lastProvider: '',
+                lastModel: '',
+                lastDims: 0,
+                lastStatus: 'unavailable'
+            };
+        }
+        try {
+            return engine.getDebugSnapshot();
+        } catch {
+            return {
+                totalCalls: 0,
+                cacheHits: 0,
+                providerCalls: 0,
+                lastProvider: '',
+                lastModel: '',
+                lastDims: 0,
+                lastStatus: 'error'
+            };
+        }
+    };
+
+    const deriveMaxTurnFromLorebook = (lorebook) => {
+        const managed = Array.isArray(lorebook) ? lorebook.filter(entry => entry?.comment && String(entry.comment).startsWith('lmai_')) : [];
+        let maxTurn = 0;
+        const turnKeys = new Set(['turn', 'upToTurn', 'lastSummaryTurn', 'currentTurn', 'lastConsolidationTurn', 'firstTurn', 'lastTurn', 't']);
+        const seenObjects = new WeakSet();
+
+        const consider = (value) => {
+            const num = Number(value);
+            if (Number.isFinite(num) && num >= 0 && num < 1000000) {
+                maxTurn = Math.max(maxTurn, Math.floor(num));
+            }
+        };
+
+        const walk = (value, parentKey = '') => {
+            if (value == null) return;
+            if (Array.isArray(value)) {
+                for (const item of value) walk(item, parentKey);
+                return;
+            }
+            if (typeof value !== 'object') {
+                if (turnKeys.has(parentKey)) consider(value);
+                return;
+            }
+            if (seenObjects.has(value)) return;
+            seenObjects.add(value);
+            for (const [key, child] of Object.entries(value)) {
+                if (turnKeys.has(key)) consider(child);
+                walk(child, key);
+            }
+        };
+
+        for (const entry of managed) {
+            try {
+                if (entry.comment === 'lmai_memory') {
+                    const metaMatch = String(entry.content || '').match(/\[META:(\{.*?\})\]/);
+                    if (metaMatch) {
+                        const meta = JSON.parse(metaMatch[1]);
+                        consider(meta?.t);
+                    }
+                }
+            } catch { /* ignore malformed meta */ }
+
+            try {
+                const parsed = JSON.parse(entry.content || '{}');
+                walk(parsed);
+            } catch { /* not all entries are JSON */ }
+        }
+
+        return maxTurn;
+    };
 
     // ══════════════════════════════════════════════════════════════
     // [UTILITY] Global Utilities
@@ -214,31 +582,27 @@
             clean = clean.replace(/<thinking>[\s\S]*$/gi, '');
             return clean;
         },
+
+        stripManagedModuleTags: (text) => {
+            if (!text) return text;
+            let clean = String(text);
+            clean = clean.replace(/<GT-CTRL\b[^>]*\/>/gi, '');
+            clean = clean.replace(/<GT-SEP\/>/gi, '');
+            clean = clean.replace(/<GigaTrans>[\s\S]*?<\/GigaTrans>/gi, '');
+            clean = stripLBDATA(clean);
+            clean = clean.replace(/\[Lightboard Platform Managed\]/gi, '');
+            clean = clean.replace(/<lb-[\w-]+(?:\s[^>]*)?>[\s\S]*?<\/lb-[\w-]+>/gi, '');
+            clean = clean.replace(/<lb-[\w-]+(?:\s[^>]*)?\/>/gi, '');
+            return clean;
+        },
         
         sanitizeForLibra: (text) => {
             if (!text) return text;
             let clean = Utils.stripLLMThinkingTags(text);
-
-            const cfg = MemoryEngine.CONFIG;
-            if (!cfg.enableGigaTrans && !cfg.enableLightboard) return clean.trim();
-            
-            // 1. GigaTrans 제거
-            if (cfg.enableGigaTrans) {
-                clean = clean.replace(/<GT-CTRL\b[^>]*\/>/gi, '');
-                clean = clean.replace(/<GT-SEP\/>/gi, '');
-                clean = clean.replace(/<GigaTrans>[\s\S]*?<\/GigaTrans>/gi, '');
-            }
-            
-            // 2. 라이트보드 제거
-            if (cfg.enableLightboard) {
-                clean = clean.replace(/\[LBDATA START\][\s\S]*?\[LBDATA END\]/gi, '');
-                clean = clean.replace(/\[Lightboard Platform Managed\]/gi, '');
-                clean = clean.replace(/<lb-[\w-]+(?:\s[^>]*)?>[\s\S]*?<\/lb-[\w-]+>/gi, '');
-                clean = clean.replace(/<lb-[\w-]+(?:\s[^>]*)?\/>/gi, '');
-            }
+            clean = Utils.stripManagedModuleTags(clean);
             
             const result = clean.trim();
-            if (cfg.debug && result !== text.trim()) {
+            if (isLibraDebugEnabled() && result !== text.trim()) {
                 console.log(`[LIBRA] Text sanitized (Module compatibility active)`);
             }
             return result;
@@ -246,7 +610,32 @@
 
         getMessageText: (msg) => {
             if (!msg || typeof msg !== 'object') return '';
-            return String(msg.data ?? msg.content ?? msg.text ?? msg.message ?? '');
+
+            const extract = (value) => {
+                if (value == null) return '';
+                if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+                    return String(value);
+                }
+                if (Array.isArray(value)) {
+                    return value.map(extract).filter(Boolean).join('\n').trim();
+                }
+                if (typeof value === 'object') {
+                    const preferredKeys = ['content', 'text', 'message', 'msg', 'mes', 'data', 'value'];
+                    for (const key of preferredKeys) {
+                        const picked = extract(value[key]);
+                        if (picked) return picked;
+                    }
+                }
+                return '';
+            };
+
+            return extract(msg.data)
+                || extract(msg.content)
+                || extract(msg.text)
+                || extract(msg.message)
+                || extract(msg.msg)
+                || extract(msg.mes)
+                || '';
         },
 
         getLibraComparableText: (text) => {
@@ -254,8 +643,244 @@
             return typeof sanitized === 'string' ? sanitized.trim() : String(sanitized || '').trim();
         },
 
+        getMemorySourceText: (text) => {
+            const strippedThinking = Utils.stripLLMThinkingTags(text);
+            const strippedManaged = Utils.stripManagedModuleTags(strippedThinking);
+            return typeof strippedManaged === 'string' ? strippedManaged.trim() : String(strippedManaged || '').trim();
+        },
+
         hasLibraVisibleContent: (text) => {
             return Utils.getLibraComparableText(text).length > 0;
+        },
+
+        isRecoverableNarrativeCandidate: (text, roleHint = 'either') => {
+            const raw = Utils.getMemorySourceText(text);
+            if (!raw || raw.length < 3) return false;
+            if (Utils.isMetaPromptLike(raw)) return false;
+            if (Utils.isTagOnlyToolResponse(raw)) return false;
+
+            const lower = raw.toLowerCase();
+            const blockedMarkers = [
+                '[lbdata start]',
+                '[lbdata end]',
+                '<past conversations>',
+                '</past conversations>',
+                '--- chat log end ---',
+                '"messages": [',
+                '"max_tokens":',
+                '"logit_bias":',
+                '## ai guidance:',
+                '## character information',
+                '<others info>',
+                '<lore>',
+                '</lore>'
+            ];
+            if (blockedMarkers.some(marker => lower.includes(marker))) return false;
+
+            if (roleHint === 'user' && /^(?:assistant|character)\s*:/im.test(raw) && !/^user\s*:/im.test(raw)) {
+                return false;
+            }
+            if (roleHint === 'ai' && /^user\s*:/im.test(raw) && !/^(?:assistant|character)\s*:/im.test(raw) && !/\[응답\]/.test(raw)) {
+                return false;
+            }
+            return true;
+        },
+
+        scoreNarrativeCandidate: (text, roleHint = 'either') => {
+            const raw = Utils.getMemorySourceText(text);
+            if (!Utils.isRecoverableNarrativeCandidate(raw, roleHint)) return -Infinity;
+
+            const lower = raw.toLowerCase();
+            let score = 0;
+
+            score += Math.min(8, Math.floor(raw.length / 180));
+            if (/\n/.test(raw)) score += 2;
+            if (/["“”]|'.+?'/.test(raw)) score += 2;
+            if (/⏱️|\[사용자\]|\[응답\]|^user\s*:|^(assistant|character)\s*:/im.test(raw)) score += 3;
+            if (/<current input>/i.test(raw)) score -= 2;
+            if (/\bjson\b|logit_bias|max_tokens|stream\s*:\s*true/i.test(lower)) score -= 6;
+            if (/##\s*ai guidance:|##\s*character information|<others info>|<lore>/i.test(raw)) score -= 6;
+            if (roleHint === 'user' && /^user\s*:/im.test(raw)) score += 2;
+            if (roleHint === 'ai' && /^(assistant|character)\s*:/im.test(raw)) score += 2;
+            if (roleHint === 'ai' && /⏱️|chatindex|@hidden spoiler@|# response/i.test(raw)) score += 3;
+
+            return score;
+        },
+
+        extractNarrativePayload: (text, roleHint = 'either') => {
+            const raw = Utils.getMemorySourceText(text);
+            if (!raw) return '';
+            if (!Utils.isMetaPromptLike(raw) && !Utils.isTagOnlyToolResponse(raw)) {
+                return Utils.isRecoverableNarrativeCandidate(raw, roleHint) ? raw : '';
+            }
+
+            const seen = new Set();
+            const candidates = [];
+            const pushCandidate = (value) => {
+                const candidate = Utils.getMemorySourceText(value);
+                if (!candidate) return;
+                const normalized = candidate.trim();
+                if (!normalized || seen.has(normalized)) return;
+                seen.add(normalized);
+                candidates.push(normalized);
+            };
+
+            const tagged = Utils.splitTaggedTurn(raw);
+            if (roleHint !== 'ai') pushCandidate(tagged.user);
+            if (roleHint !== 'user') pushCandidate(tagged.ai);
+
+            const currentInputMatch = raw.match(/<Current Input>\s*```([\s\S]*?)```\s*<\/Current Input>/i);
+            pushCandidate(currentInputMatch?.[1] || '');
+
+            const userMatch = raw.match(/(?:^|\n)\s*USER:\s*"([\s\S]*?)"\s*(?=\n\s*(?:CHARACTER:|ASSISTANT:|SYSTEM:|$))/i);
+            if (roleHint !== 'ai') pushCandidate(userMatch?.[1] || '');
+
+            const assistantMatch = raw.match(/(?:^|\n)\s*(?:ASSISTANT|CHARACTER):\s*([\s\S]*?)\s*(?=\n\s*(?:USER:|SYSTEM:|$))/i);
+            if (roleHint !== 'user') pushCandidate(assistantMatch?.[1] || '');
+
+            const ranked = candidates
+                .map(candidate => ({ candidate, score: Utils.scoreNarrativeCandidate(candidate, roleHint) }))
+                .filter(item => Number.isFinite(item.score))
+                .sort((a, b) => b.score - a.score);
+
+            return ranked[0]?.candidate || '';
+        },
+
+        getNarrativeComparableText: (text, roleHint = 'either') => {
+            return Utils.extractNarrativePayload(text, roleHint);
+        },
+
+        getNarrativeSourceText: (text, roleHint = 'either') => {
+            return Utils.extractNarrativePayload(text, roleHint);
+        },
+
+        isTagOnlyToolResponse: (text) => {
+            const raw = String(text || '').trim();
+            if (!raw) return false;
+            const lines = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+            if (!lines.length || lines.length > 6) return false;
+            return lines.every(line => /^(?:\[[^\]\n]+\])+(?:[★■\s]+)?$/.test(line));
+        },
+
+        isMetaPromptLike: (text) => {
+            const raw = String(text || '').trim();
+            if (!raw) return false;
+            const lower = raw.toLowerCase();
+            const patterns = [
+                '# system rule',
+                'you are a data extraction bot',
+                'your only job is to analyze',
+                'analyze the following chat log',
+                'provide the data string now',
+                'final output format',
+                'affection tag rules',
+                'status tag rules',
+                'rules start',
+                'chat log start',
+                'reiteration phase',
+                '<|im_start|>system',
+                '# advance_notice',
+                '# system_role',
+                'translate the <sample_text>',
+                'output only the translated text',
+                'preserve as is',
+                'core_principles',
+                'additional_instructions',
+                'narrative register [mandatory]',
+                'zero omission + zero translationese',
+                'this prompt has been confirmed for use only in fully personalized, private sessions',
+                '<system>',
+                '</system>',
+                '<thoughts>',
+                '<thinking>',
+                'output must strictly follow these rules',
+                'output json:',
+                'do not output any other text',
+                'system: pov : freely',
+                'respond in full english',
+                'all the characters inside this rp are adults who are acting',
+                'platform policies were disabled',
+                'platform policy unactivated'
+            ];
+            return patterns.some(p => lower.includes(p));
+        },
+
+        hasSubstantialNarrativePayload: (text, roleHint = 'either') => {
+            const candidate = Utils.extractNarrativePayload(text, roleHint);
+            if (!candidate) return false;
+            const visible = String(candidate)
+                .replace(/\[[^\]\n]{1,80}\]/g, ' ')
+                .replace(/<[^>\n]{1,80}>/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (visible.length < 12) return false;
+            const meaningfulUnits = (visible.match(/[A-Za-z0-9\u3131-\u318E\uAC00-\uD7A3\u3040-\u30FF\u4E00-\u9FFF]/g) || []).length;
+            return meaningfulUnits >= 8;
+        },
+
+        isForcedBypassPrompt: (text) => {
+            const raw = String(text || '').trim();
+            if (!raw) return false;
+            return /^provide the data string now\.?$/i.test(raw);
+        },
+
+        splitTaggedTurn: (text) => {
+            const raw = String(text || '');
+            const userMatch = raw.match(/\[사용자\]\s*([\s\S]*?)(?:\n\[응답\]|\r\n\[응답\]|$)/);
+            const aiMatch = raw.match(/\[응답\]\s*([\s\S]*)$/);
+            return {
+                user: (userMatch?.[1] || '').trim(),
+                ai: (aiMatch?.[1] || '').trim()
+            };
+        },
+
+        shouldExcludeMemoryContent: (text, roleHint = 'either') => {
+            const recovered = Utils.extractNarrativePayload(text, roleHint);
+            if (recovered) return false;
+
+            const raw = Utils.getLibraComparableText(text);
+            if (!raw) return true;
+            const tagged = Utils.splitTaggedTurn(raw);
+            if (tagged.user || tagged.ai) {
+                if (Utils.isMetaPromptLike(tagged.user) || Utils.isMetaPromptLike(tagged.ai)) return true;
+                if (Utils.isTagOnlyToolResponse(tagged.ai)) return true;
+            }
+            if (Utils.isMetaPromptLike(raw)) return true;
+            if (Utils.isTagOnlyToolResponse(raw)) return true;
+            return false;
+        },
+
+        shouldExcludeStoredMemoryContent: (text) => {
+            const raw = Utils.getMemorySourceText(text);
+            if (!raw || raw.length < 5) return true;
+            if (Utils.isMetaPromptLike(raw)) return true;
+            if (Utils.isTagOnlyToolResponse(raw)) return true;
+
+            const tagged = Utils.splitTaggedTurn(raw);
+            if (tagged.user && Utils.isMetaPromptLike(tagged.user)) return true;
+            if (tagged.ai && Utils.isTagOnlyToolResponse(tagged.ai)) return true;
+            return false;
+        },
+
+        shouldBypassNarrativeSystems: (userText, aiText = '') => {
+            const user = Utils.getNarrativeComparableText(userText, 'user');
+            const ai = Utils.getNarrativeComparableText(aiText, 'ai');
+            const rawUser = Utils.getMemorySourceText(userText);
+            const hasNarrativePayload =
+                Utils.hasSubstantialNarrativePayload(userText, 'user') ||
+                Utils.hasSubstantialNarrativePayload(aiText, 'ai');
+
+            if (!user && !ai && !hasNarrativePayload) return true;
+            if (Utils.isForcedBypassPrompt(user) || Utils.isForcedBypassPrompt(rawUser)) return true;
+            return false;
+        },
+
+        isNarrativeRequestType: (type) => {
+            const normalized = String(type || '').trim().toLowerCase();
+            if (!normalized) return true;
+            if (normalized === 'model' || normalized === 'submodel' || normalized === 'otherax') return true;
+            if (normalized === 'memory' || normalized === 'emotion' || normalized === 'translate') return false;
+            return true;
         }
     };
 
@@ -271,6 +896,27 @@
         narrative: () => 'lmai_narrative::core',
         charStates: () => 'lmai_char_states::core',
         worldStates: () => 'lmai_world_states::core'
+    };
+
+    const parseLooseJson = (text) => {
+        if (!text || typeof text !== 'string') return null;
+        const cleaned = Utils.stripLLMThinkingTags(text).trim();
+        try {
+            return JSON.parse(cleaned);
+        } catch {}
+        const codeBlock = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+        if (codeBlock) {
+            try {
+                const inner = codeBlock[1].trim().match(/\{[\s\S]*\}/);
+                if (inner) return JSON.parse(inner[0]);
+            } catch {}
+        }
+        try {
+            const match = cleaned.match(/\{[\s\S]*\}/);
+            return match ? JSON.parse(match[0]) : null;
+        } catch {
+            return null;
+        }
     };
 
     // ══════════════════════════════════════════════════════════════
@@ -293,6 +939,24 @@
     "world_rules": ["감지된 세계관 규칙"]
 }
 
+[외형 필수 항목]
+characters의 details 중 외모에 다음을 반드시 포함하여 기술하십시오:
+- 머리색, 머리모양, 피부색, 눈 모양, 눈 색, 키, 체형
+- 여성 캐릭터의 경우 가슴 크기, 성기 특징도 반드시 포함
+- 남성 캐릭터의 경우 성기 특징도 반드시 포함 (크기, 형태 등)
+- 대화에서 직접 언급되지 않더라도 묘사에서 유추 가능하면 추출
+
+[성격 필수 항목]
+characters의 details 중 성격에 다음을 반드시 포함하여 기술하십시오:
+- 성관념/Sexual attitudes (e.g. "개방적", "보수적", "순결주의")
+- 성적취향/Sexual preferences (e.g. "이성애", "양성애", "S성향", "M성향")
+- 대화에서 직접 언급되지 않더라도 묘사에서 유추 가능하면 추출
+
+[출력 언어 규칙 / Output Language Rules]
+- 이름(name)은 반드시 "한글(English)" 형식으로 작성하십시오. (e.g. "정수진(Jeong Sujin)", "히비키(Hibiki)")
+- 이름을 제외한 모든 서술(details, events, status, world_rules 등)은 반드시 영문으로 작성하십시오.
+- Names MUST be in "한글(English)" format. All other descriptions MUST be written in English.
+
 주의: 반드시 유효한 JSON 구조만 반환하십시오. 다른 설명은 생략하십시오.`;
 
         const FinalSynthesisPrompt = `당신은 여러 개의 대화 요약본을 하나로 통합하는 마스터 편집자입니다.
@@ -306,7 +970,239 @@
     "world": { "tech": "기술수준", "rules": ["규칙들"] }
 }
 
+[외형 필수 항목]
+entities의 appearance에 다음을 반드시 포함하여 기술하십시오:
+- 머리색, 머리모양, 피부색, 눈 모양, 눈 색, 키, 체형
+- 여성 캐릭터의 경우 가슴 크기, 성기 특징도 반드시 포함
+- 남성 캐릭터의 경우 성기 특징도 반드시 포함 (크기, 형태 등)
+- 원본 요약 데이터에서 유추 가능하면 반드시 추출
+
+[성격 필수 항목]
+entities의 personality에 다음을 반드시 포함하여 기술하십시오:
+- 성관념 (e.g. "개방적", "보수적", "순결주의")
+- 성적취향 (e.g. "이성애", "양성애", "S성향", "M성향")
+- 원본 요약 데이터에서 유추 가능하면 반드시 추출
+
+[출력 언어 규칙 / Output Language Rules]
+- 이름(name)은 반드시 "한글(English)" 형식으로 작성하십시오. (e.g. "정수진(Jeong Sujin)", "히비키(Hibiki)")
+- 이름을 제외한 모든 서술(appearance, personality, narrative 등)은 반드시 영문으로 작성하십시오.
+- Names MUST be in "한글(English)" format. All other descriptions MUST be written in English.
+
 주의: 반드시 JSON만 반환하십시오.`;
+
+        const ReanalysisReviewPrompt = `당신은 대화 로그를 재검증하는 서사 데이터 감사관입니다.
+현재 구축된 데이터와 새로 재분석한 후보 데이터를 비교하고, 제공된 원문 대화 발췌를 기준으로 더 정확한 내용을 선택하거나 보정하십시오.
+
+반드시 다음 JSON 형식만 반환하십시오:
+{
+  "narrative": "검증 후 최종 줄거리 요약",
+  "entities": [ { "name": "이름", "appearance": "외모", "personality": "성격", "background": "배경" } ],
+  "relations": [ { "entityA": "이름", "entityB": "이름", "type": "관계유형", "sentiment": "감정상태" } ],
+  "world": { "tech": "기술수준", "rules": ["규칙들"] },
+  "reviewNotes": ["어떤 부분을 왜 선택/보정했는지 짧은 근거"]
+}
+
+규칙:
+- 원문 대화 발췌에 근거가 없는 정보는 제거하십시오.
+- 현재 데이터와 후보 데이터 중 더 정확한 쪽을 선택하되, 필요하면 둘을 보정 결합할 수 있습니다.
+- 추측하지 말고 원문 근거를 우선하십시오.
+- 반드시 JSON만 반환하십시오.`;
+
+        const ReanalysisFinalArbiterPrompt = `당신은 재분석 최종 판정자입니다.
+기존 구조 데이터, 새로 생성된 후보 데이터, 그리고 부분 review 결과들을 함께 검토하여 가장 정확한 최종 서사 데이터를 결정하십시오.
+
+반드시 다음 JSON 형식만 반환하십시오:
+{
+  "narrative": "최종 줄거리 요약",
+  "entities": [ { "name": "이름", "appearance": "외모", "personality": "성격", "background": "배경" } ],
+  "relations": [ { "entityA": "이름", "entityB": "이름", "type": "관계유형", "sentiment": "감정상태" } ],
+  "world": { "tech": "기술수준", "rules": ["규칙들"] }
+}
+
+규칙:
+- 부분 review 결과들은 원문 발췌를 기반으로 한 보정 근거입니다.
+- 기존 구조 데이터와 후보 데이터가 충돌하면, review 결과와 일치하는 쪽을 우선하십시오.
+- review 결과가 일부만 다루는 경우에는 나머지 필드는 가장 일관된 데이터를 유지하십시오.
+- 반드시 JSON만 반환하십시오.`;
+
+        const ANALYSIS_MAX_LINE_CHARS = 900;
+        const ANALYSIS_MAX_CHUNK_CHARS = 9000;
+        const SYNTHESIS_MAX_INPUT_CHARS = 12000;
+        const REVIEW_EXCERPT_MAX_CHARS = 5000;
+        const REVIEW_DATA_MAX_CHARS = 2200;
+        const REANALYSIS_REVIEW_WINDOW_CHARS = 2600;
+        const REANALYSIS_REVIEW_WINDOW_MESSAGES = 18;
+        const REANALYSIS_REVIEW_WINDOW_OVERLAP = 4;
+        const REANALYSIS_REVIEW_MAX_WINDOWS = 6;
+        const IMPORT_KNOWLEDGE_MAX_ITEM_CHARS = 1800;
+
+        const truncateForLLM = (value, maxChars, marker = '\n...[TRUNCATED]...\n') => {
+            const text = String(value || '');
+            const limit = Math.max(0, Number(maxChars) || 0);
+            if (!limit || text.length <= limit) return text;
+            if (limit <= marker.length + 20) return text.slice(0, limit);
+            const remain = limit - marker.length;
+            const headSize = Math.ceil(remain * 0.6);
+            const tailSize = Math.max(0, remain - headSize);
+            return `${text.slice(0, headSize)}${marker}${tailSize > 0 ? text.slice(-tailSize) : ''}`;
+        };
+
+        const compactTextArray = (items, maxItems = 6, maxItemChars = 240) => {
+            return dedupeTextArray(items)
+                .slice(0, maxItems)
+                .map(item => truncateForLLM(item, maxItemChars, ' ...[TRUNCATED]... '));
+        };
+
+        const compactChunkSummary = (summary) => ({
+            events: compactTextArray(summary?.events, 6, 220),
+            characters: (Array.isArray(summary?.characters) ? summary.characters : [])
+                .slice(0, 8)
+                .map(ch => ({
+                    name: truncateForLLM(ch?.name || '', 80, ' ... '),
+                    details: truncateForLLM(ch?.details || '', 420, ' ...[TRUNCATED]... ')
+                }))
+                .filter(ch => ch.name || ch.details),
+            relationships: (Array.isArray(summary?.relationships) ? summary.relationships : [])
+                .slice(0, 8)
+                .map(rel => ({
+                    pair: Array.isArray(rel?.pair) ? rel.pair.slice(0, 2).map(name => truncateForLLM(name || '', 80, ' ... ')) : [],
+                    status: truncateForLLM(rel?.status || '', 260, ' ...[TRUNCATED]... ')
+                }))
+                .filter(rel => rel.pair.length === 2 || rel.status),
+            world_rules: compactTextArray(summary?.world_rules, 8, 220)
+        });
+
+        const buildBoundedJsonArray = (items, maxChars, fallbackValue = []) => {
+            const list = Array.isArray(items) ? items : [];
+            if (list.length === 0) return JSON.stringify(fallbackValue);
+            const out = [];
+            for (const item of list) {
+                out.push(item);
+                const serialized = JSON.stringify(out);
+                if (serialized.length > maxChars) {
+                    out.pop();
+                    break;
+                }
+            }
+            if (out.length === 0) {
+                return truncateForLLM(JSON.stringify([list[0]]), maxChars);
+            }
+            return JSON.stringify(out);
+        };
+
+        const compactStructuredSnapshot = (data) => ({
+            narrative: truncateForLLM(data?.narrative || '', 1200, ' ...[TRUNCATED]... '),
+            entities: (Array.isArray(data?.entities) ? data.entities : [])
+                .slice(0, 10)
+                .map(entity => ({
+                    name: truncateForLLM(entity?.name || '', 80, ' ... '),
+                    appearance: truncateForLLM(entity?.appearance || '', 260, ' ...[TRUNCATED]... '),
+                    personality: truncateForLLM(entity?.personality || '', 260, ' ...[TRUNCATED]... '),
+                    background: truncateForLLM(entity?.background || '', 260, ' ...[TRUNCATED]... ')
+                }))
+                .filter(entity => entity.name),
+            relations: (Array.isArray(data?.relations) ? data.relations : [])
+                .slice(0, 12)
+                .map(relation => ({
+                    entityA: truncateForLLM(relation?.entityA || '', 80, ' ... '),
+                    entityB: truncateForLLM(relation?.entityB || '', 80, ' ... '),
+                    type: truncateForLLM(relation?.type || '', 180, ' ...[TRUNCATED]... '),
+                    sentiment: truncateForLLM(relation?.sentiment || '', 220, ' ...[TRUNCATED]... ')
+                }))
+                .filter(relation => relation.entityA && relation.entityB),
+            world: {
+                tech: truncateForLLM(data?.world?.tech || '', 120, ' ... '),
+                rules: compactTextArray(data?.world?.rules, 10, 220)
+            }
+        });
+
+        const buildCompactStructuredJson = (data, maxChars = REVIEW_DATA_MAX_CHARS) => {
+            return buildBoundedJsonArray([compactStructuredSnapshot(data)], maxChars, [{}]).replace(/^\[(.*)\]$/s, '$1');
+        };
+
+        const stripReviewNotes = (data) => {
+            if (!data || typeof data !== 'object') return data;
+            const { reviewNotes, ...rest } = data;
+            return rest;
+        };
+
+        const buildReanalysisReviewWindows = (msgs) => {
+            const source = Array.isArray(msgs) ? msgs : [];
+            if (source.length === 0) return [];
+            const windows = [];
+            let start = 0;
+            while (start < source.length && windows.length < REANALYSIS_REVIEW_MAX_WINDOWS) {
+                const collected = [];
+                let totalChars = 0;
+                let idx = start;
+                while (idx < source.length && collected.length < REANALYSIS_REVIEW_WINDOW_MESSAGES) {
+                    const item = source[idx];
+                    const role = (item?.msg?.role === 'user' || item?.msg?.is_user) ? 'User' : 'AI';
+                    const line = `${role}: ${truncateForLLM(item?.text || '', 500, ' ...[TRUNCATED]... ')}`;
+                    const delta = line.length + (collected.length > 0 ? 2 : 0);
+                    if (collected.length > 0 && totalChars + delta > REANALYSIS_REVIEW_WINDOW_CHARS) break;
+                    collected.push(item);
+                    totalChars += delta;
+                    idx += 1;
+                }
+                if (collected.length === 0) {
+                    const single = source[start];
+                    windows.push([single]);
+                    start += 1;
+                } else {
+                    windows.push(collected);
+                    if (idx >= source.length) break;
+                    start = Math.max(start + 1, idx - REANALYSIS_REVIEW_WINDOW_OVERLAP);
+                }
+            }
+            return windows;
+        };
+
+        const buildAnalysisChunkText = (chunk) => {
+            const lines = (Array.isArray(chunk) ? chunk : [])
+                .filter(({ msg }) => msg != null)
+                .map(({ msg, text }) => {
+                    const role = (msg?.role === 'user' || msg?.is_user) ? 'User' : 'AI';
+                    return `${role}: ${truncateForLLM(text, ANALYSIS_MAX_LINE_CHARS, ' ...[TRUNCATED]... ')}`;
+                })
+                .filter(Boolean);
+            if (lines.length === 0) return '';
+            let joined = lines.join('\n\n');
+            if (joined.length <= ANALYSIS_MAX_CHUNK_CHARS) return joined;
+
+            const kept = [];
+            let total = 0;
+            let left = 0;
+            let right = lines.length - 1;
+            while (left <= right) {
+                const takeLeft = kept.length % 2 === 0;
+                const candidate = takeLeft ? lines[left++] : lines[right--];
+                if (!candidate) continue;
+                const delta = candidate.length + (kept.length > 0 ? 2 : 0);
+                if (total + delta > ANALYSIS_MAX_CHUNK_CHARS) break;
+                if (takeLeft) kept.push(candidate);
+                else kept.splice(Math.max(1, kept.length), 0, candidate);
+                total += delta;
+            }
+
+            const marker = '...[CHUNK TRUNCATED FOR ANALYSIS]...';
+            if (left <= right && total + marker.length + 2 <= ANALYSIS_MAX_CHUNK_CHARS) {
+                const headCount = Math.ceil(kept.length / 2);
+                joined = [
+                    ...kept.slice(0, headCount),
+                    marker,
+                    ...kept.slice(headCount)
+                ].join('\n\n');
+                return truncateForLLM(joined, ANALYSIS_MAX_CHUNK_CHARS);
+            }
+            joined = kept.join('\n\n');
+            return truncateForLLM(joined, ANALYSIS_MAX_CHUNK_CHARS);
+        };
+
+        const buildSynthesisInput = (chunkSummaries) => {
+            const compacted = (Array.isArray(chunkSummaries) ? chunkSummaries : []).map(compactChunkSummary);
+            return buildBoundedJsonArray(compacted, SYNTHESIS_MAX_INPUT_CHARS, []);
+        };
 
         const check = async () => {
             if (isProcessing) return;
@@ -331,29 +1227,6 @@
                     await startAutoSummarization();
                 }
             }
-        };
-
-        const extractJson = (text) => {
-            if (!text || typeof text !== 'string') return null;
-            // LLM 사고/필터 태그 제거
-            const cleaned = Utils.stripLLMThinkingTags(text).trim();
-            try {
-                // 1차: 직접 파싱 시도
-                return JSON.parse(cleaned);
-            } catch { /* fallback */ }
-            // 2차: 코드블록 내 JSON 추출
-            const codeBlock = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/);
-            if (codeBlock) {
-                try {
-                    const inner = codeBlock[1].trim().match(/\{[\s\S]*\}/);
-                    if (inner) return JSON.parse(inner[0]);
-                } catch { /* fallback */ }
-            }
-            // 3차: 일반 JSON 추출
-            try {
-                const match = cleaned.match(/\{[\s\S]*\}/);
-                return match ? JSON.parse(match[0]) : null;
-            } catch { return null; }
         };
 
         const normalizeKnowledgeText = (value) => String(value || '')
@@ -448,9 +1321,9 @@
             const sanitized = sanitizeStructuredKnowledge(finalData);
             await loreLock.writeLock();
             try {
-                const char = await risuai.getCharacter();
+                const char = await requireLoadedCharacter();
                 const chat = char.chats?.[char.chatPage];
-                let lore = [...MemoryEngine.getEffectiveLorebook(char, chat)];
+                let lore = [...MemoryEngine.getLorebook(char, chat)];
                 
                 LMAI_GUI.toast("데이터 반영 중...");
 
@@ -464,9 +1337,10 @@
                         firstTurn: 0,
                         lastTurn: 0,
                         recentEvents: [{ turn: 0, brief: "Cold Start: Initial summary applied." }],
-                        summaries: [{ upToTurn: 0, summary: sanitized.narrative || '', keyPoints: [], timestamp: Date.now() }],
+                        summaries: [{ upToTurn: 0, summary: sanitized.narrative || '', keyPoints: [], ongoingTensions: [], timestamp: Date.now() }],
                         currentContext: sanitized.narrative || '',
-                        keyPoints: []
+                        keyPoints: [],
+                        ongoingTensions: []
                     }];
                 }
 
@@ -514,6 +1388,7 @@
                 await HierarchicalWorldManager.saveWorldGraphUnsafe(lore);
                 await NarrativeTracker.saveState(lore);
                 await StoryAuthor.saveState(lore);
+                await Director.saveState(lore);
                 await CharacterStateTracker.saveState(lore);
                 await WorldStateTracker.saveState(lore);
                 
@@ -572,7 +1447,7 @@
                 } else {
                     char.lorebook = lore;
                 }
-                await risuai.setCharacter(char);
+                await persistLoreToActiveChat(chat, lore);
 
                 LMAI_GUI.toast("✨ LIBRA 초기 메모리 구축이 완료되었습니다!");
                 delete MemoryState.pendingColdStartData;
@@ -591,6 +1466,146 @@
             sourceId: 'baseline'
         });
 
+        const buildConversationExcerpt = (msgs, maxChars = REVIEW_EXCERPT_MAX_CHARS) => {
+            const lines = (Array.isArray(msgs) ? msgs : [])
+                .filter(({ msg }) => msg != null)
+                .map(({ msg, text }) => `${(msg?.role === 'user' || msg?.is_user) ? 'User' : 'AI'}: ${truncateForLLM(text, 700, ' ...[TRUNCATED]... ')}`)
+                .filter(Boolean);
+            const full = lines.join('\n\n');
+            return truncateForLLM(full, maxChars, '\n\n...[TRUNCATED FOR REVIEW]...\n\n');
+        };
+
+        const buildCurrentStructuredSnapshot = (lore) => {
+            const narrativeState = NarrativeTracker.getState?.() || { storylines: [] };
+            const storylines = Array.isArray(narrativeState.storylines) ? narrativeState.storylines : [];
+            const narrative = storylines
+                .map(storyline => {
+                    const parts = [];
+                    if (storyline.name) parts.push(storyline.name);
+                    if (storyline.currentContext) parts.push(storyline.currentContext);
+                    if (Array.isArray(storyline.keyPoints) && storyline.keyPoints.length > 0) parts.push(`Key: ${storyline.keyPoints.join('; ')}`);
+                    if (Array.isArray(storyline.ongoingTensions) && storyline.ongoingTensions.length > 0) parts.push(`Flow: ${storyline.ongoingTensions.join('; ')}`);
+                    return parts.join(' | ');
+                })
+                .filter(Boolean)
+                .join('\n');
+            const entities = Array.from(EntityManager.getEntityCache().values()).map(entity => ({
+                name: entity.name || '',
+                appearance: [...(entity.appearance?.features || []), ...(entity.appearance?.distinctiveMarks || []), ...(entity.appearance?.clothing || [])].filter(Boolean).join(', '),
+                personality: [...(entity.personality?.traits || []), ...(entity.personality?.likes || []), ...(entity.personality?.dislikes || [])].filter(Boolean).join(', '),
+                background: [entity.background?.origin || '', entity.background?.occupation || '', ...(entity.background?.history || [])].filter(Boolean).join(', ')
+            }));
+            const relations = Array.from(EntityManager.getRelationCache().values()).map(relation => ({
+                entityA: relation.entityA || '',
+                entityB: relation.entityB || '',
+                type: relation.relationType || '',
+                sentiment: [relation.sentiments?.fromAtoB || '', relation.sentiments?.fromBtoA || ''].filter(Boolean).join(' / ')
+            }));
+            const profile = HierarchicalWorldManager.getProfile();
+            const rootNode = profile?.nodes?.get(profile?.rootId);
+            return sanitizeStructuredKnowledge({
+                narrative,
+                entities,
+                relations,
+                world: {
+                    tech: rootNode?.rules?.exists?.technology || '',
+                    rules: rootNode?.rules?.physics?.special_phenomena || []
+                }
+            });
+        };
+
+        const replaceStructuredKnowledge = async (finalData, options = {}) => {
+            const opts = {
+                worldNote: 'Rebuilt via Reanalysis',
+                sourceId: 'reanalysis',
+                ...options
+            };
+            const sanitized = sanitizeStructuredKnowledge(finalData);
+            await loreLock.writeLock();
+            try {
+                const char = await requireLoadedCharacter();
+                const chat = char.chats?.[char.chatPage];
+                let lore = [...MemoryEngine.getLorebook(char, chat)];
+
+                lore = lore.filter(entry => ![
+                    'lmai_entity',
+                    'lmai_relation',
+                    'lmai_narrative',
+                    'lmai_story_author',
+                    'lmai_char_states',
+                    'lmai_world_states'
+                ].includes(entry.comment));
+
+                EntityManager.clearCache();
+                for (const ent of (sanitized.entities || [])) {
+                    if (!ent.name) continue;
+                    EntityManager.updateEntity(ent.name, {
+                        appearance: { features: [ent.appearance || ''] },
+                        personality: { traits: [ent.personality || ''] },
+                        background: { origin: ent.background || '' },
+                        source: 'reanalysis',
+                        s_id: opts.sourceId
+                    }, lore);
+                }
+                for (const rel of (sanitized.relations || [])) {
+                    if (!rel.entityA || !rel.entityB) continue;
+                    EntityManager.updateRelation(rel.entityA, rel.entityB, {
+                        relationType: rel.type || '',
+                        sentiments: { fromAtoB: rel.sentiment || '' },
+                        s_id: opts.sourceId
+                    }, lore);
+                }
+
+                NarrativeTracker.resetState({
+                    storylines: [{
+                        id: 1,
+                        name: 'Rebuilt Storyline',
+                        entities: (sanitized.entities || []).map(e => e.name).filter(Boolean),
+                        turns: [0],
+                        firstTurn: 0,
+                        lastTurn: 0,
+                        recentEvents: [{ turn: 0, brief: 'Past conversation reanalysis applied.' }],
+                        summaries: [{ upToTurn: 0, summary: sanitized.narrative || '', keyPoints: [], ongoingTensions: [], timestamp: Date.now() }],
+                        currentContext: sanitized.narrative || '',
+                        keyPoints: [],
+                        ongoingTensions: []
+                    }],
+                    turnLog: [],
+                    lastSummaryTurn: 0
+                });
+                StoryAuthor.resetState();
+                CharacterStateTracker.resetState();
+                WorldStateTracker.resetState();
+
+                HierarchicalWorldManager.loadWorldGraph(lore);
+                const profile = HierarchicalWorldManager.getProfile();
+                const rootNode = profile?.nodes?.get(profile?.rootId);
+                if (rootNode) {
+                    rootNode.rules = rootNode.rules || { exists: {}, systems: {}, physics: {}, custom: {} };
+                    rootNode.rules.exists = rootNode.rules.exists || {};
+                    rootNode.rules.physics = rootNode.rules.physics || {};
+                    rootNode.rules.exists.technology = String(sanitized.world?.tech || '').trim();
+                    rootNode.rules.physics.special_phenomena = [...(sanitized.world?.rules || [])];
+                    rootNode.meta.notes = opts.worldNote;
+                    rootNode.meta.s_id = opts.sourceId;
+                }
+
+                await HierarchicalWorldManager.saveWorldGraphUnsafe(lore);
+                await NarrativeTracker.saveState(lore);
+                await StoryAuthor.saveState(lore);
+                await Director.saveState(lore);
+                await CharacterStateTracker.saveState(lore);
+                await WorldStateTracker.saveState(lore);
+                await EntityManager.saveToLorebook(char, chat, lore);
+
+                if (chat) chat.localLore = lore;
+                else char.lorebook = lore;
+                await persistLoreToActiveChat(chat, lore);
+            } finally {
+                loreLock.writeUnlock();
+            }
+        };
+
         const synthesizeStructuredKnowledge = async (rawTexts, taskLabel = 'knowledge-import') => {
             const texts = (Array.isArray(rawTexts) ? rawTexts : [])
                 .map(v => String(v || '').trim())
@@ -604,9 +1619,9 @@
             }
 
             const chunkPromises = textChunks.map((chunk, i) => {
-                const chunkText = chunk.map((text, idx) => `Knowledge ${idx + 1}: ${text}`).join('\n\n');
+                const chunkText = chunk.map((text, idx) => `Knowledge ${idx + 1}: ${truncateForLLM(text, IMPORT_KNOWLEDGE_MAX_ITEM_CHARS, ' ...[TRUNCATED]... ')}`).join('\n\n');
                 return runMaintenanceLLM(() =>
-                    LLMProvider.call(MemoryEngine.CONFIG, ColdStartSummaryPrompt, chunkText, { maxTokens: 1500 })
+                    LLMProvider.call(MemoryEngine.CONFIG, ColdStartSummaryPrompt, chunkText, { maxTokens: 1500, profile: 'aux' })
                 , `${taskLabel}-chunk-${i + 1}`);
             });
             const chunkResults = await Promise.allSettled(chunkPromises);
@@ -623,12 +1638,13 @@
             let finalData = null;
             for (let attempt = 0; attempt < 2 && !finalData; attempt++) {
                 try {
+                    const synthesisInput = buildSynthesisInput(chunkSummaries);
                     const synthesisResult = await runMaintenanceLLM(() =>
                         LLMProvider.call(
                             MemoryEngine.CONFIG,
                             FinalSynthesisPrompt,
-                            JSON.stringify(chunkSummaries),
-                            { maxTokens: 2000 }
+                            synthesisInput,
+                            { maxTokens: 2000, profile: 'aux' }
                         )
                     , `${taskLabel}-synthesis-${attempt + 1}`);
                     if (synthesisResult?.content) finalData = extractJson(synthesisResult.content);
@@ -664,6 +1680,179 @@
             return finalData;
         };
 
+        const buildAnalyzableMessages = (chat) => {
+            const msgs_all = getChatMessages(chat);
+            const historyLimit = resolveColdStartHistoryLimit(
+                MemoryEngine.CONFIG.coldStartScopePreset,
+                MemoryEngine.CONFIG.coldStartHistoryLimit
+            );
+            const sourceMsgs = historyLimit > 0 ? msgs_all.slice(-historyLimit) : msgs_all;
+            return sourceMsgs
+                .filter(m => m.id !== MemoryState.ignoredGreetingId)
+                .map(m => ({ msg: m, text: getComparableMessageText(m) }))
+                .filter(item => {
+                    if (!item.text || !item.msg) return false;
+                    const isUser = item.msg?.role === 'user' || item.msg?.is_user;
+                    if (isUser && Utils.isMetaPromptLike(item.text)) return false;
+                    if (!isUser && (Utils.isMetaPromptLike(item.text) || Utils.isTagOnlyToolResponse(item.text))) return false;
+                    return !Utils.shouldExcludeMemoryContent(item.text);
+                });
+        };
+
+        const analyzeConversationMessages = async (msgs, taskLabel = 'cold-start') => {
+            if (!Array.isArray(msgs) || msgs.length === 0) return null;
+            const chunks = [];
+            const chunkSize = 25;
+            for (let i = 0; i < msgs.length; i += chunkSize) {
+                chunks.push(msgs.slice(i, i + chunkSize));
+            }
+
+            LMAI_GUI.toast(`총 ${chunks.length}개 청크 병렬 분석 시작...`);
+
+            const chunkPromises = chunks.map((chunk, i) => {
+                const chunkText = buildAnalysisChunkText(chunk);
+                return runMaintenanceLLM(() =>
+                    LLMProvider.call(MemoryEngine.CONFIG, ColdStartSummaryPrompt, chunkText, { maxTokens: 1500, profile: 'aux' })
+                , `${taskLabel}-chunk-${i + 1}`);
+            });
+            const chunkResults = await Promise.allSettled(chunkPromises);
+
+            const chunkSummaries = [];
+            for (const result of chunkResults) {
+                if (result.status === 'fulfilled' && result.value.content) {
+                    const parsed = extractJson(result.value.content);
+                    if (parsed) chunkSummaries.push(parsed);
+                }
+            }
+            if (chunkSummaries.length === 0) throw new Error("분석 결과 생성 실패: LLM이 구성되지 않았거나 응답을 파싱할 수 없습니다.");
+
+            LMAI_GUI.toast("최종 데이터 합성 중...");
+            let finalData = null;
+            for (let attempt = 0; attempt < 2 && !finalData; attempt++) {
+                if (attempt > 0) LMAI_GUI.toast("합성 재시도 중...");
+                try {
+                    const synthesisInput = buildSynthesisInput(chunkSummaries);
+                    const synthesisResult = await runMaintenanceLLM(() =>
+                        LLMProvider.call(
+                            MemoryEngine.CONFIG,
+                            FinalSynthesisPrompt,
+                            synthesisInput,
+                            { maxTokens: 2000, profile: 'aux' }
+                        )
+                    , `${taskLabel}-synthesis-${attempt + 1}`);
+                    if (synthesisResult.skipped) throw new Error("LLM이 구성되지 않았습니다.");
+                    if (synthesisResult.content) finalData = extractJson(synthesisResult.content);
+                } catch (synthErr) {
+                    if (attempt === 0) console.warn("[LIBRA] Synthesis attempt failed, retrying:", synthErr?.message);
+                }
+            }
+
+            if (!finalData) {
+                console.warn("[LIBRA] Final synthesis failed, using chunk merge fallback");
+                const merged = {
+                    narrative: chunkSummaries.map(c => (c.events || []).join('; ')).filter(Boolean).join(' ') || "Cold Start: Initial analysis applied.",
+                    entities: [],
+                    relations: [],
+                    world: { tech: "unknown", rules: [] }
+                };
+                const nameSet = new Set();
+                for (const chunk of chunkSummaries) {
+                    for (const ch of (chunk.characters || [])) {
+                        if (ch.name && !nameSet.has(ch.name)) {
+                            nameSet.add(ch.name);
+                            merged.entities.push({ name: ch.name, appearance: ch.details || "", personality: "", background: "" });
+                        }
+                    }
+                    for (const rel of (chunk.relationships || [])) {
+                        if (rel.pair?.length === 2) {
+                            merged.relations.push({ entityA: rel.pair[0], entityB: rel.pair[1], type: rel.status || "", sentiment: "" });
+                        }
+                    }
+                    merged.world.rules.push(...(chunk.world_rules || []));
+                }
+                finalData = merged;
+            }
+            return finalData;
+        };
+
+        const reanalyzeHistoricalConversation = async () => {
+            isProcessing = true;
+            try {
+                const char = await risuai.getCharacter();
+                if (!char) throw new Error("캐릭터 데이터를 불러올 수 없습니다.");
+                const chat = char.chats?.[char.chatPage];
+                if (!chat) throw new Error("채팅방을 찾을 수 없습니다.");
+                const lore = MemoryEngine.getLorebook(char, chat);
+                const msgs = buildAnalyzableMessages(chat);
+                if (msgs.length === 0) throw new Error("재분석할 대화 내역이 없습니다.");
+
+                const candidateData = await analyzeConversationMessages(msgs, 'cold-reanalysis');
+                const currentData = buildCurrentStructuredSnapshot(lore);
+                let finalData = candidateData;
+
+                if (LLMProvider.isConfigured(MemoryEngine.CONFIG, 'aux')) {
+                    try {
+                        const reviewWindows = buildReanalysisReviewWindows(msgs);
+                        const reviewedResults = [];
+                        for (let i = 0; i < reviewWindows.length; i++) {
+                            const reviewInput = [
+                                `[원문 대화 발췌 / Source Conversation Excerpt]`,
+                                buildConversationExcerpt(reviewWindows[i], REANALYSIS_REVIEW_WINDOW_CHARS),
+                                ``,
+                                `[현재 구축된 데이터 / Current Structured Data]`,
+                                buildCompactStructuredJson(currentData, REVIEW_DATA_MAX_CHARS),
+                                ``,
+                                `[재분석 후보 데이터 / Reanalyzed Candidate Data]`,
+                                buildCompactStructuredJson(candidateData, REVIEW_DATA_MAX_CHARS)
+                            ].join('\n');
+                            LMAI_GUI.toast(`기존 데이터와 재분석 후보를 대조 중... (${i + 1}/${reviewWindows.length})`);
+                            const reviewResult = await runMaintenanceLLM(() =>
+                                LLMProvider.call(MemoryEngine.CONFIG, ReanalysisReviewPrompt, reviewInput, { maxTokens: 1400, profile: 'aux' })
+                            , `cold-reanalysis-review-${i + 1}`);
+                            const reviewed = extractJson(reviewResult?.content || '');
+                            if (reviewed) reviewedResults.push(stripReviewNotes(reviewed));
+                        }
+
+                        if (LLMProvider.isConfigured(MemoryEngine.CONFIG, 'primary')) {
+                            LMAI_GUI.toast("메인 LLM이 최종 데이터를 판정 중...");
+                            const arbiterInput = [
+                                `[현재 구축된 데이터 / Current Structured Data]`,
+                                buildCompactStructuredJson(currentData, REVIEW_DATA_MAX_CHARS),
+                                ``,
+                                `[재분석 후보 데이터 / Reanalyzed Candidate Data]`,
+                                buildCompactStructuredJson(candidateData, REVIEW_DATA_MAX_CHARS),
+                                ``,
+                                `[부분 Review 결과 / Partial Review Results]`,
+                                buildBoundedJsonArray(reviewedResults.map(stripReviewNotes), SYNTHESIS_MAX_INPUT_CHARS, [])
+                            ].join('\n');
+                            const arbiterResult = await runMaintenanceLLM(() =>
+                                LLMProvider.call(MemoryEngine.CONFIG, ReanalysisFinalArbiterPrompt, arbiterInput, { maxTokens: 1800, profile: 'primary' })
+                            , 'cold-reanalysis-final-arbiter');
+                            const arbited = extractJson(arbiterResult?.content || '');
+                            if (arbited) finalData = arbited;
+                        } else if (reviewedResults.length === 1) {
+                            finalData = reviewedResults[0];
+                        } else if (reviewedResults.length > 1) {
+                            finalData = reviewedResults[reviewedResults.length - 1];
+                        }
+                    } catch (e) {
+                        console.warn('[LIBRA] Reanalysis review fallback to candidate:', e?.message || e);
+                    }
+                }
+
+                await replaceStructuredKnowledge(finalData, {
+                    sourceId: 'reanalysis',
+                    worldNote: 'Rebuilt via Reanalysis'
+                });
+                LMAI_GUI.toast("♻️ 과거 대화 재분석 및 재구축 완료");
+            } catch (e) {
+                console.error("[LIBRA] Reanalysis Error:", e);
+                LMAI_GUI.toast(`❌ 재분석 실패: ${e.message || e}`);
+            } finally {
+                isProcessing = false;
+            }
+        };
+
         const integrateImportedKnowledge = async (rawTexts, sourceLabel = 'Hypa V3') => {
             if (!MemoryEngine.CONFIG.useLLM) {
                 throw new Error("LLM 사용이 꺼져 있어 구조화 분석을 진행할 수 없습니다.");
@@ -692,91 +1881,10 @@
                 if (!chat || msgs_all.length === 0) {
                     throw new Error("분석할 대화 내역이 없습니다.");
                 }
-                // 인사말 필터링 적용
-                const historyLimit = resolveColdStartHistoryLimit(
-                    MemoryEngine.CONFIG.coldStartScopePreset,
-                    MemoryEngine.CONFIG.coldStartHistoryLimit
-                );
-                const sourceMsgs = historyLimit > 0 ? msgs_all.slice(-historyLimit) : msgs_all;
-                const msgs = sourceMsgs.filter(m => (m.text || m.msg || m.mes || m.data) && m.id !== MemoryState.ignoredGreetingId);
+                const msgs = buildAnalyzableMessages(chat);
                 
                 if (msgs.length === 0) throw new Error("분석할 대화 내역이 없습니다.");
-
-                const chunks = [];
-                const chunkSize = 25;
-                for (let i = 0; i < msgs.length; i += chunkSize) {
-                    chunks.push(msgs.slice(i, i + chunkSize));
-                }
-
-                LMAI_GUI.toast(`총 ${chunks.length}개 청크 병렬 분석 시작...`);
-
-                const chunkPromises = chunks.map((chunk, i) => {
-                    const chunkText = chunk.map(m => `${(m.role === 'user' || m.is_user) ? 'User' : 'AI'}: ${m.text || m.msg || m.mes || m.data}`).join('\n\n');
-                    return runMaintenanceLLM(() =>
-                        LLMProvider.call(MemoryEngine.CONFIG, ColdStartSummaryPrompt, chunkText, { maxTokens: 1500 })
-                    , `cold-start-chunk-${i + 1}`);
-                });
-                const chunkResults = await Promise.allSettled(chunkPromises);
-
-                const chunkSummaries = [];
-                for (const result of chunkResults) {
-                    if (result.status === 'fulfilled' && result.value.content) {
-                        const parsed = extractJson(result.value.content);
-                        if (parsed) chunkSummaries.push(parsed);
-                    }
-                }
-
-                if (chunkSummaries.length === 0) throw new Error("분석 결과 생성 실패: LLM이 구성되지 않았거나 응답을 파싱할 수 없습니다.");
-
-                LMAI_GUI.toast("최종 데이터 합성 중...");
-
-                // 최종 합성 (1회 재시도 포함)
-                let finalData = null;
-                for (let attempt = 0; attempt < 2 && !finalData; attempt++) {
-                    if (attempt > 0) LMAI_GUI.toast("합성 재시도 중...");
-                    try {
-                        const synthesisResult = await runMaintenanceLLM(() =>
-                            LLMProvider.call(
-                                MemoryEngine.CONFIG, 
-                                FinalSynthesisPrompt, 
-                                JSON.stringify(chunkSummaries), 
-                                { maxTokens: 2000 }
-                            )
-                        , `cold-start-synthesis-${attempt + 1}`);
-                        if (synthesisResult.skipped) throw new Error("LLM이 구성되지 않았습니다.");
-                        if (synthesisResult.content) finalData = extractJson(synthesisResult.content);
-                    } catch (synthErr) {
-                        if (attempt === 0) console.warn("[LIBRA] Synthesis attempt failed, retrying:", synthErr?.message);
-                    }
-                }
-
-                // 합성 실패 시 청크 요약 병합으로 폴백
-                if (!finalData) {
-                    console.warn("[LIBRA] Final synthesis failed, using chunk merge fallback");
-                    LMAI_GUI.toast("합성 실패 — 청크 병합 폴백 적용 중...");
-                    const merged = {
-                        narrative: chunkSummaries.map(c => (c.events || []).join('; ')).filter(Boolean).join(' ') || "Cold Start: Initial analysis applied.",
-                        entities: [],
-                        relations: [],
-                        world: { tech: "unknown", rules: [] }
-                    };
-                    const nameSet = new Set();
-                    for (const chunk of chunkSummaries) {
-                        for (const ch of (chunk.characters || [])) {
-                            if (ch.name && !nameSet.has(ch.name)) {
-                                nameSet.add(ch.name);
-                                merged.entities.push({ name: ch.name, appearance: ch.details || "", personality: "", background: "" });
-                            }
-                        }
-                        for (const rel of (chunk.relationships || [])) {
-                            if (rel.pair?.length === 2) {
-                                merged.relations.push({ entityA: rel.pair[0], entityB: rel.pair[1], type: rel.status || "", sentiment: "" });
-                            }
-                        }
-                        merged.world.rules.push(...(chunk.world_rules || []));
-                    }
-                    finalData = merged;
-                }
+                const finalData = await analyzeConversationMessages(msgs, 'cold-start');
 
                 if (MemoryEngine.CONFIG.debug) console.log("[LIBRA] Cold Start Synthesis Data:", finalData);
                 
@@ -791,7 +1899,7 @@
             }
         };
 
-        return { check, startAutoSummarization, integrateImportedKnowledge };
+        return { check, startAutoSummarization, reanalyzeHistoricalConversation, integrateImportedKnowledge };
     })();
 
     // ══════════════════════════════════════════════════════════════
@@ -860,22 +1968,28 @@
         };
 
         const executeTransition = async () => {
-            await loreLock.writeLock();
             try {
-                const char = await risuai.getCharacter();
-                const chat = char.chats?.[char.chatPage];
-                const lore = (chat?.localLore) || char.lorebook || [];
+                const sourceChar = await requireLoadedCharacter();
+                const sourceChat = sourceChar.chats?.[sourceChar.chatPage];
+                const lore = [...MemoryEngine.getLorebook(sourceChar, sourceChat)];
+                const sourceChatId = sourceChat?.id || null;
 
                 LMAI_GUI.toast("데이터 패키징 중...");
 
                 // 1. 직전 상황 요약 생성 (Graceful Degradation 적용)
                 let sceneSummary = "";
                 try {
-                    const msgs_all = getChatMessages(chat);
-                    const lastMsgs = msgs_all.slice(-10).filter(m => (m.text || m.msg || m.mes || m.data) && m.id !== MemoryState.ignoredGreetingId);
+                    const msgs_all = getChatMessages(sourceChat);
+                    const lastMsgs = msgs_all.slice(-10)
+                        .filter(m => m.id !== MemoryState.ignoredGreetingId)
+                        .map(m => ({ msg: m, text: getComparableMessageText(m) }))
+                        .filter(item => item.text);
                     if (lastMsgs.length > 0) {
                         LMAI_GUI.toast("직전 상황 요약 중...");
-                        const contextText = lastMsgs.map(m => `${(m.role === 'user' || m.is_user) ? 'User' : 'AI'}: ${m.text || m.msg || m.mes || m.data}`).join('\n\n');
+                        const contextText = lastMsgs
+                            .filter(({ msg }) => msg != null)
+                            .map(({ msg, text }) => `${(msg?.role === 'user' || msg?.is_user) ? 'User' : 'AI'}: ${text}`)
+                            .join('\n\n');
                         const result = await LLMProvider.call(MemoryEngine.CONFIG, TransitionSummaryPrompt, contextText, { maxTokens: 800 });
                         if (result.content) sceneSummary = Utils.stripLLMThinkingTags(result.content).trim();
                     }
@@ -886,51 +2000,66 @@
                 // 2. 새 채팅방에 주입할 로어 구축
                 const inheritedLore = _buildInheritedLore(lore, sceneSummary);
 
-                // 2b. 비정상 종료 대비 복구 버퍼 저장
-                await risuai.pluginStorage.setItem(BUFFER_KEY, JSON.stringify({
-                    loreEntries: inheritedLore,
-                    sceneSummary,
-                    memoryState: {
-                        gcCursor: MemoryState.gcCursor || 0,
-                        currentTurn: MemoryState.currentTurn || 0
+                await loreLock.writeLock();
+                try {
+                    // 3. 새 채팅방 생성 및 데이터 직접 주입
+                    LMAI_GUI.toast("새 채팅방 생성 중...");
+                    const latestChar = await requireLoadedCharacter();
+                    const latestChat = latestChar.chats?.[latestChar.chatPage];
+                    const latestSourceChatId = latestChat?.id || null;
+                    if (latestSourceChatId !== sourceChatId) {
+                        throw new LIBRAError('Active chat changed during transition', 'CHAT_CHANGED');
                     }
-                }));
 
-                // 3. 새 채팅방 생성 및 데이터 직접 주입
-                LMAI_GUI.toast("새 채팅방 생성 중...");
+                    const nextChar = cloneForMutation(latestChar);
+                    nextChar.chats = Array.isArray(nextChar.chats) ? nextChar.chats : [];
+                    const chatCount = nextChar.chats.length;
+                    const newChat = {
+                        message: [],
+                        note: '',
+                        name: `Session ${chatCount + 1} (LIBRA)`,
+                        localLore: inheritedLore,
+                        fmIndex: -1,
+                        id: _generateUUID()
+                    };
 
-                const chatCount = char.chats ? char.chats.length : 0;
-                const newChat = {
-                    message: [],
-                    note: '',
-                    name: `Session ${chatCount + 1} (LIBRA)`,
-                    localLore: inheritedLore,
-                    fmIndex: -1,
-                    id: _generateUUID()
-                };
+                    nextChar.chats.unshift(newChat);
+                    nextChar.chatPage = 0;
 
-                if (!char.chats) char.chats = [];
-                char.chats.unshift(newChat);
-                char.chatPage = 0;
+                    await risuai.pluginStorage.setItem(BUFFER_KEY, JSON.stringify({
+                        loreEntries: inheritedLore,
+                        sceneSummary,
+                        sourceChatId,
+                        targetChatId: newChat.id,
+                        createdAt: Date.now(),
+                        memoryState: {
+                            gcCursor: MemoryState.gcCursor || 0,
+                            currentTurn: MemoryState.currentTurn || 0
+                        }
+                    }));
 
-                await risuai.setCharacter(char);
+                    await risuai.setCharacter(nextChar);
 
-                // 4. 세션 추적 갱신
-                MemoryState._activeChatId = newChat.id;
-                MemoryState.currentSessionId = `sess_${newChat.id}_${Date.now()}`;
+                    // 4. 세션 추적 갱신
+                    MemoryState._activeChatId = newChat.id;
+                    MemoryState.currentSessionId = `sess_${newChat.id}_${Date.now()}`;
 
-                // 5. 엔진 재로드
-                HierarchicalWorldManager.loadWorldGraph(inheritedLore, true);
-                EntityManager.rebuildCache(inheritedLore);
-                NarrativeTracker.loadState(inheritedLore);
-                StoryAuthor.loadState(inheritedLore);
-                CharacterStateTracker.loadState(inheritedLore);
-                WorldStateTracker.loadState(inheritedLore);
+                    // 5. 엔진 재로드
+                    HierarchicalWorldManager.loadWorldGraph(inheritedLore, true);
+                    EntityManager.rebuildCache(inheritedLore);
+                    NarrativeTracker.loadState(inheritedLore);
+                    StoryAuthor.loadState(inheritedLore);
+                    Director.loadState(inheritedLore);
+                    CharacterStateTracker.loadState(inheritedLore);
+                    WorldStateTracker.loadState(inheritedLore);
 
-                // 6. 상태 복구
-                MemoryState.isSessionRestored = true;
-                await identifyGreeting();
-                await risuai.pluginStorage.removeItem(BUFFER_KEY);
+                    // 6. 상태 복구
+                    MemoryState.isSessionRestored = true;
+                    await identifyGreeting();
+                    await risuai.pluginStorage.removeItem(BUFFER_KEY);
+                } finally {
+                    loreLock.writeUnlock();
+                }
 
                 console.log("[LIBRA] Session transition complete. New chat created with inherited data.");
                 LMAI_GUI.toast("✨ 새 세션이 생성되었습니다! 모든 기억이 계승되었습니다.");
@@ -938,8 +2067,6 @@
             } catch (e) {
                 console.error("[LIBRA] Execute Transition Error:", e);
                 return false;
-            } finally {
-                loreLock.writeUnlock();
             }
         };
 
@@ -961,13 +2088,38 @@
                 const char = await risuai.getCharacter();
                 const chat = char.chats?.[char.chatPage];
                 let currentLore = (chat?.localLore) || char.lorebook || [];
+                const currentChatId = chat?.id || null;
+                const currentMsgs = getChatMessages(chat);
+                const currentManaged = MemoryEngine.getManagedEntries(currentLore);
+                let currentMaxTurn = 0;
+                for (const entry of currentManaged) {
+                    const meta = MemoryEngine.getCachedMeta(entry);
+                    if (meta?.t > currentMaxTurn) currentMaxTurn = meta.t;
+                }
+                const bufferedTurn = Number(buffer?.memoryState?.currentTurn || 0);
+                const targetChatId = buffer?.targetChatId || null;
+                const sourceChatId = buffer?.sourceChatId || null;
+                const targetMismatch = !!targetChatId && !!currentChatId && targetChatId !== currentChatId;
+                const likelyProgressed =
+                    (Array.isArray(currentMsgs) && currentMsgs.length > 1) ||
+                    currentMaxTurn > bufferedTurn;
+
+                if (targetMismatch) {
+                    console.warn(`[LIBRA] Skipping stale transition restore: target chat ${targetChatId} != current chat ${currentChatId}`);
+                    return false;
+                }
+
+                if (likelyProgressed) {
+                    console.warn(`[LIBRA] Skipping transition restore because current chat already progressed beyond buffer (chat=${currentChatId}, source=${sourceChatId}, turn ${currentMaxTurn} > ${bufferedTurn} or msgs=${currentMsgs.length})`);
+                    return false;
+                }
 
                 LMAI_GUI.toast("이전 기억 복구 중...");
 
                 const libraComments = [
                     "lmai_world_graph", "lmai_world_node", "lmai_entity", 
                     "lmai_relation", "lmai_narrative", "lmai_story_author", "lmai_char_states", 
-                    "lmai_world_states", SCENE_CONTEXT_KEY
+                    "lmai_world_states"
                 ];
                 
                 let updatedLore = currentLore.filter(e => !libraComments.includes(e.comment) && e.key !== SCENE_CONTEXT_KEY);
@@ -987,9 +2139,16 @@
 
                 // 1b. 이전 세션 lmai_memory 병합 (기존 현재 세션 메모리는 보존)
                 if (memoryEntries.length > 0) {
-                    const existingKeys = new Set(updatedLore.map(e => e.key));
+                    const metaPat = /\[META:(\{[^}]+\})\]/;
+                    const existingContents = new Set(
+                        updatedLore
+                            .filter(e => e.comment === 'lmai_memory')
+                            .map(e => (e.content || '').replace(metaPat, '').trim())
+                            .filter(c => c)
+                    );
                     for (const mem of memoryEntries) {
-                        if (!existingKeys.has(mem.key)) {
+                        const memContent = (mem.content || '').replace(metaPat, '').trim();
+                        if (memContent && !existingContents.has(memContent)) {
                             updatedLore.push(mem);
                         }
                     }
@@ -1019,7 +2178,7 @@
                 if (chat) chat.localLore = updatedLore;
                 else char.lorebook = updatedLore;
                 
-                await risuai.setCharacter(char);
+                await persistLoreToActiveChat(chat, updatedLore, { saveCheckpoint: true });
 
                 // 세션 추적 갱신
                 MemoryState._activeChatId = chat?.id || null;
@@ -1029,6 +2188,7 @@
                 EntityManager.rebuildCache(updatedLore);
                 NarrativeTracker.loadState(updatedLore);
                 StoryAuthor.loadState(updatedLore);
+                Director.loadState(updatedLore);
                 CharacterStateTracker.loadState(updatedLore);
                 WorldStateTracker.loadState(updatedLore);
 
@@ -1073,7 +2233,7 @@
     // [ENGINE] Sync & Rollback Engine
     // ══════════════════════════════════════════════════════════════
     const SyncEngine = (() => {
-        const TRANSIENT_MISSING_GRACE_MS = 4000;
+        const TRANSIENT_MISSING_GRACE_MS = 15000;
 
         const getTrackerMeta = (tracked) => {
             if (tracked && typeof tracked === 'object' && !Array.isArray(tracked)) return tracked;
@@ -1087,6 +2247,13 @@
                 return false;
             }
 
+            if (isRefreshDeleteBlocked()) {
+                if (MemoryEngine.CONFIG.debug) {
+                    console.log('[LIBRA] syncMemory deletion skipped during refresh protection window');
+                }
+                return false;
+            }
+
             const now = Date.now();
             const currentMsgIds = new Set();
             const comparableTextToMsgId = new Map();
@@ -1095,10 +2262,13 @@
                 if (!msg?.id) continue;
                 currentMsgIds.add(msg.id);
 
-                const comparableText = Utils.getLibraComparableText(Utils.getMessageText(msg));
+                const roleHint = (msg?.role === 'user' || msg?.is_user) ? 'user' : 'ai';
+                const comparableText = Utils.getNarrativeComparableText(Utils.getMessageText(msg), roleHint);
                 if (comparableText) {
                     comparableTextToMsgId.set(TokenizerEngine.simpleHash(comparableText), msg.id);
                     MemoryState.transientMissing.delete(msg.id);
+                } else if (MemoryEngine.CONFIG.debug) {
+                    console.log(`[LIBRA] syncMemory skipped comparable text for msg ${msg.id}`);
                 }
             }
 
@@ -1114,7 +2284,7 @@
                     MemoryState.rollbackTracker.delete(id);
                     MemoryState.transientMissing.delete(id);
                     if (MemoryEngine.CONFIG.debug) {
-                        console.log(`[LIBRA] Message tracker migrated ${id} -> ${replacementId}`);
+                        console.log(`[LIBRA] Message tracker migrated ${id} -> ${replacementId} via sourceHash remap`);
                     }
                     continue;
                 }
@@ -1141,14 +2311,15 @@
 
             await loreLock.writeLock();
             try {
+                const workingLore = Array.isArray(lore) ? lore.map(entry => safeClone(entry)) : [];
                 let changed = false;
                 let removedCount = 0;
                 const currentSession = MemoryState.currentSessionId;
 
                 for (const m_id of deletedMsgIds) {
                     // 1. 로어북 스캔 및 조건부 삭제
-                    for (let i = lore.length - 1; i >= 0; i--) {
-                        const entry = lore[i];
+                    for (let i = workingLore.length - 1; i >= 0; i--) {
+                        const entry = workingLore[i];
                         try {
                             // lmai_memory: [META:...] 태그로 m_id 확인
                             const metaMatch = entry.content?.match(/\[META:(\{.*?\})\]/);
@@ -1156,7 +2327,7 @@
                                 const meta = JSON.parse(metaMatch[1]);
                                 // 방어 로직: 현재 세션이 아니거나 baseline인 경우 절대 삭제 안함
                                 if (meta.m_id === m_id && meta.s_id === currentSession && meta.s_id !== 'baseline') {
-                                    lore.splice(i, 1);
+                                    workingLore.splice(i, 1);
                                     changed = true;
                                     removedCount++;
                                 }
@@ -1184,7 +2355,12 @@
                                     removedCount++;
                                 }
                             }
-                        } catch (e) { continue; }
+                        } catch (e) {
+                            if (MemoryEngine.CONFIG?.debug) {
+                                console.warn('[LIBRA] SyncEngine entry processing error:', e?.message);
+                            }
+                            continue;
+                        }
                     }
 
                     // 2. 트래커에서 제거
@@ -1194,15 +2370,16 @@
 
                 if (changed) {
                     // 캐시 재구축
-                    EntityManager.rebuildCache(lore);
-                    HierarchicalWorldManager.loadWorldGraph(lore, true);
-                    NarrativeTracker.loadState(lore);
-                    StoryAuthor.loadState(lore);
-                    CharacterStateTracker.loadState(lore);
-                    WorldStateTracker.loadState(lore);
+                    EntityManager.rebuildCache(workingLore);
+                    HierarchicalWorldManager.loadWorldGraph(workingLore, true);
+                    NarrativeTracker.loadState(workingLore);
+                    StoryAuthor.loadState(workingLore);
+                    Director.loadState(workingLore);
+                    CharacterStateTracker.loadState(workingLore);
+                    WorldStateTracker.loadState(workingLore);
                     
-                    MemoryEngine.setLorebook(char, chat, lore);
-                    await risuai.setCharacter(char);
+                    MemoryEngine.setLorebook(char, chat, workingLore);
+                    await persistLoreToActiveChat(chat, workingLore);
                     
                     // Unobtrusive feedback
                     console.log(`[LIBRA] 🔄 Phantom memory synced (cleaned ${removedCount} lore links tied to deleted messages)`);
@@ -1218,6 +2395,688 @@
 
         return { syncMemory };
     })();
+
+    // ══════════════════════════════════════════════════════════════
+    // [ENGINE] Missed Turn Recovery
+    // ══════════════════════════════════════════════════════════════
+    const TurnRecoveryEngine = (() => {
+        const POLL_MS = 4000;
+        const MAX_RECOVER_PER_PASS = 2;
+        const MAX_SCAN_MESSAGES = 60;
+        let inFlight = false;
+        let timerStarted = false;
+        let pollTimerId = null;
+
+        const getProcessedMessageIds = (lore) => {
+            const ids = new Set();
+            for (const entry of MemoryEngine.getManagedEntries(lore)) {
+                const meta = MemoryEngine.getCachedMeta(entry);
+                if (meta?.m_id) ids.add(meta.m_id);
+            }
+            for (const id of MemoryState.rollbackTracker.keys()) ids.add(id);
+            if (MemoryState.ignoredGreetingId) ids.add(MemoryState.ignoredGreetingId);
+            return ids;
+        };
+
+        const findPreviousUserMessage = (msgs, startIndex) => {
+            for (let i = startIndex - 1; i >= 0; i--) {
+                const msg = msgs[i];
+                if (msg && (msg.role === 'user' || msg.is_user)) return msg;
+            }
+            return null;
+        };
+
+        const collectRecoverableTurns = (chat, lore) => {
+            const msgs = getChatMessages(chat);
+            const processedIds = getProcessedMessageIds(lore);
+            const pendingHashes = PendingTurnManager.getPendingComparableHashes(chat);
+            const windowed = msgs.slice(-MAX_SCAN_MESSAGES);
+            const recoverable = [];
+            let lastProcessedNarrativeIdx = -1;
+
+            for (let i = 0; i < windowed.length; i++) {
+                const msg = windowed[i];
+                if (!msg || msg.role === 'user' || msg.is_user) continue;
+
+                const aiText = Utils.getNarrativeComparableText(Utils.getMessageText(msg), 'ai');
+                if (!aiText) continue;
+                if (pendingHashes.has(TokenizerEngine.simpleHash(aiText))) continue;
+
+                const previousUser = findPreviousUserMessage(windowed, i);
+                const userText = getStrictNarrativeUserText(Utils.getMessageText(previousUser));
+                if (Utils.shouldBypassNarrativeSystems(userText, aiText)) continue;
+
+                if (msg.id && processedIds.has(msg.id)) {
+                    lastProcessedNarrativeIdx = i;
+                }
+            }
+
+            for (let i = Math.max(0, lastProcessedNarrativeIdx + 1); i < windowed.length; i++) {
+                const msg = windowed[i];
+                if (!msg || msg.role === 'user' || msg.is_user) continue;
+                if (!msg.id || processedIds.has(msg.id)) continue;
+
+                const aiText = Utils.getNarrativeComparableText(Utils.getMessageText(msg), 'ai');
+                if (!aiText) continue;
+                if (pendingHashes.has(TokenizerEngine.simpleHash(aiText))) continue;
+
+                const previousUser = findPreviousUserMessage(windowed, i);
+                const userText = getStrictNarrativeUserText(Utils.getMessageText(previousUser));
+                if (Utils.shouldBypassNarrativeSystems(userText, aiText)) continue;
+
+                recoverable.push({
+                    aiMsg: msg,
+                    userMsg: userText || '',
+                    aiResponse: aiText
+                });
+            }
+
+            return recoverable.slice(-MAX_RECOVER_PER_PASS);
+        };
+
+        const processRecoveredTurns = async (char, chat, lore, turns, reason = 'recovery') => {
+            if (!Array.isArray(turns) || turns.length === 0) return 0;
+            let recoveredCount = 0;
+            const config = MemoryEngine.CONFIG;
+
+            for (const turn of turns) {
+                const m_id = turn.aiMsg?.id;
+                if (!m_id) continue;
+
+                const currentProcessedIds = getProcessedMessageIds(lore);
+                if (currentProcessedIds.has(m_id)) continue;
+
+                MemoryEngine.incrementTurn();
+                const currentTurn = MemoryEngine.getCurrentTurn();
+                const turnState = await processNarrativeTurnState(char, chat, lore, turn.userMsg, turn.aiResponse, m_id);
+                const memoryImportance = config.emotionEnabled
+                    ? EmotionEngine.boostImportance(5, turnState.conversationEmotion)
+                    : 5;
+                const memoryContent = `[사용자] ${turn.userMsg}\n[응답] ${turn.aiResponse}`;
+
+                const newMemory = await MemoryEngine.prepareMemory(
+                    { content: memoryContent, importance: memoryImportance },
+                    currentTurn, lore, lore, char, chat, m_id
+                );
+
+                if (newMemory) {
+                    lore.push(newMemory);
+                }
+
+                MemoryState.rollbackTracker.set(m_id, {
+                    loreKeys: newMemory ? [newMemory.key || TokenizerEngine.getSafeMapKey(newMemory.content)] : [],
+                    sourceHash: turn.aiResponse ? TokenizerEngine.simpleHash(turn.aiResponse) : null
+                });
+                MemoryState.transientMissing.delete(m_id);
+
+                await HierarchicalWorldManager.saveWorldGraph(char, chat, lore);
+                await EntityManager.saveToLorebook(char, chat, lore);
+                await CharacterStateTracker.saveState(lore);
+                await WorldStateTracker.saveState(lore);
+
+                const effectiveLoreForAuthor = MemoryEngine.getEffectiveLorebook(char, chat);
+                await Promise.allSettled([
+                    ...turnState.entitiesToConsolidate.map(name =>
+                        CharacterStateTracker.consolidateIfNeeded(name, currentTurn, config)
+                    ),
+                    WorldStateTracker.consolidateIfNeeded(currentTurn, config)
+                ]);
+                try {
+                    await StoryAuthor.updatePlanIfNeeded(
+                        currentTurn,
+                        config,
+                        turn.userMsg,
+                        turn.aiResponse,
+                        turnState.involvedEntities,
+                        effectiveLoreForAuthor
+                    );
+                } catch (e) {
+                    console.warn('[LIBRA] Story author recovery update failed:', e?.message || e);
+                }
+                try {
+                    await Director.updateDirective(
+                        currentTurn,
+                        config,
+                        turn.userMsg,
+                        turn.aiResponse,
+                        turnState.involvedEntities,
+                        effectiveLoreForAuthor
+                    );
+                } catch (e) {
+                    console.warn('[LIBRA] Director recovery update failed:', e?.message || e);
+                }
+                recoveredCount++;
+            }
+
+            if (recoveredCount === 0) return 0;
+
+            const narrativeState = NarrativeTracker.getState();
+            if (narrativeState && typeof narrativeState === 'object') {
+                narrativeState.lastSummaryTurn = 0;
+            }
+            await Promise.allSettled([
+                NarrativeTracker.summarizeIfNeeded(MemoryEngine.getCurrentTurn(), config)
+            ]);
+
+            await NarrativeTracker.saveState(lore);
+            await StoryAuthor.saveState(lore);
+            await Director.saveState(lore);
+            MemoryEngine.setLorebook(char, chat, lore);
+            await persistLoreToActiveChat(chat, lore, { saveCheckpoint: true });
+
+            if (config.debug) {
+                console.log(`[LIBRA] Recovered ${recoveredCount} missed turn(s) via ${reason}`);
+            }
+            return recoveredCount;
+        };
+
+        const recoverIfNeeded = async (reason = 'manual-check') => {
+            if (inFlight) return 0;
+            if (reason === 'polling' && isRefreshStabilizing()) {
+                if (MemoryEngine.CONFIG.debug) {
+                    console.log('[LIBRA] polling recovery delayed during refresh stabilization window');
+                }
+                return 0;
+            }
+            inFlight = true;
+            try {
+                const char = await risuai.getCharacter();
+                const chat = char?.chats?.[char?.chatPage];
+                if (!char || !chat) return 0;
+                const lore = [...MemoryEngine.getLorebook(char, chat)];
+                if (!MemoryState.isInitialized) await _lazyInit(lore);
+
+                const _chatId = chat?.id || null;
+                if (MemoryState._activeChatId !== _chatId) {
+                    reloadChatScopedRuntime(lore, _chatId, { resetSessionCaches: true, forceWorldReload: true });
+                    MemoryState.currentSessionId = `sess_${_chatId || 'global'}_${Date.now()}`;
+                } else {
+                    HierarchicalWorldManager.loadWorldGraph(lore);
+                    if (EntityManager.getEntityCache().size === 0) {
+                        reloadChatScopedRuntime(lore, _chatId, { forceWorldReload: false });
+                    }
+                }
+                if (!MemoryState.currentSessionId) {
+                    MemoryState.currentSessionId = `sess_${_chatId || 'global'}_${Date.now()}`;
+                }
+
+                const pendingResult = await PendingTurnManager.finalizePending(char, chat, reason);
+                if (pendingResult?.status === 'finalized') {
+                    return 0;
+                }
+
+                const recoverable = collectRecoverableTurns(chat, lore);
+                if (recoverable.length === 0) return 0;
+                return await processRecoveredTurns(char, chat, lore, recoverable, reason);
+            } catch (e) {
+                console.warn('[LIBRA] Missed turn recovery failed:', e?.message || e);
+                return 0;
+            } finally {
+                inFlight = false;
+            }
+        };
+
+        const stopPolling = () => {
+            if (pollTimerId != null && typeof clearInterval === 'function') {
+                clearInterval(pollTimerId);
+            }
+            pollTimerId = null;
+            timerStarted = false;
+            if (typeof globalThis !== 'undefined' && globalThis[LIBRA_TURN_RECOVERY_TIMER_CLEANUP_KEY] === stopPolling) {
+                delete globalThis[LIBRA_TURN_RECOVERY_TIMER_CLEANUP_KEY];
+            }
+        };
+        const startPolling = () => {
+            if (typeof setInterval === 'undefined') return;
+            const existingCleanup = typeof globalThis !== 'undefined' ? globalThis[LIBRA_TURN_RECOVERY_TIMER_CLEANUP_KEY] : null;
+            if (typeof existingCleanup === 'function' && existingCleanup !== stopPolling) {
+                existingCleanup();
+            }
+            if (timerStarted && pollTimerId != null) return;
+            stopPolling();
+            timerStarted = true;
+            pollTimerId = setInterval(() => {
+                recoverIfNeeded('polling').catch(() => {});
+            }, POLL_MS);
+            if (typeof globalThis !== 'undefined') {
+                globalThis[LIBRA_TURN_RECOVERY_TIMER_CLEANUP_KEY] = stopPolling;
+            }
+        };
+
+        return { recoverIfNeeded, startPolling, stopPolling };
+    })();
+
+    const RefreshCheckpointManager = (() => {
+        const KEY = 'LIBRA_REFRESH_CHECKPOINT_V1';
+        const isManaged = (entry) => Boolean(entry?.comment && String(entry.comment).startsWith('lmai_'));
+        const getSignature = (entry) => [
+            entry?.comment || '',
+            entry?.key || '',
+            TokenizerEngine.simpleHash(entry?.content || '')
+        ].join('::');
+        const getMaxTurn = (entries) => deriveMaxTurnFromLorebook(entries);
+
+        const saveCheckpoint = async (char, chat, lore) => {
+            if (!char || !chat || !Array.isArray(lore)) return false;
+            const managed = lore.filter(isManaged);
+            if (managed.length === 0) return false;
+
+            const payload = {
+                chatId: chat.id || null,
+                savedAt: Date.now(),
+                maxTurn: getMaxTurn(managed),
+                entries: managed
+            };
+
+            await risuai.pluginStorage.setItem(KEY, JSON.stringify(payload));
+            return true;
+        };
+
+        const restoreIfAhead = async (char, chat, lore) => {
+            if (!char || !chat || !Array.isArray(lore)) return false;
+            let raw;
+            try {
+                raw = await risuai.pluginStorage.getItem(KEY);
+            } catch {
+                return false;
+            }
+            if (!raw) return false;
+
+            let payload;
+            try {
+                payload = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            } catch {
+                return false;
+            }
+
+            if (!payload?.chatId || payload.chatId !== (chat.id || null) || !Array.isArray(payload.entries)) {
+                return false;
+            }
+
+            const currentManaged = lore.filter(isManaged);
+            const currentMaxTurn = getMaxTurn(currentManaged);
+            const checkpointMaxTurn = Number(payload.maxTurn || 0);
+            if (checkpointMaxTurn <= currentMaxTurn) return false;
+
+            const nonManaged = lore.filter(entry => !isManaged(entry));
+            const mergedManaged = [];
+            const seen = new Set();
+            for (const entry of payload.entries) {
+                const sig = getSignature(entry);
+                if (seen.has(sig)) continue;
+                seen.add(sig);
+                mergedManaged.push(entry);
+            }
+
+            const nextLore = [...nonManaged, ...mergedManaged];
+            MemoryEngine.setLorebook(char, chat, nextLore);
+            await persistLoreToActiveChat(chat, nextLore);
+            MemoryEngine.rebuildIndex(nextLore);
+            HierarchicalWorldManager.loadWorldGraph(nextLore, true);
+            EntityManager.rebuildCache(nextLore);
+            NarrativeTracker.loadState(nextLore);
+            StoryAuthor.loadState(nextLore);
+            Director.loadState(nextLore);
+            CharacterStateTracker.loadState(nextLore);
+            WorldStateTracker.loadState(nextLore);
+            MemoryEngine.setTurn(checkpointMaxTurn);
+
+            console.log(`[LIBRA] Refresh checkpoint restored for chat ${chat.id} (turn ${currentMaxTurn} -> ${checkpointMaxTurn})`);
+            return true;
+        };
+
+        return { saveCheckpoint, restoreIfAhead };
+    })();
+
+    const findLatestAssistantMessage = (chat) => {
+        const msgs = getChatMessages(chat);
+        for (let i = msgs.length - 1; i >= 0; i--) {
+            const msg = msgs[i];
+            if (!msg || msg.role === 'user' || msg.is_user) continue;
+            return msg;
+        }
+        return null;
+    };
+
+    const scheduleTurnMaintenance = (char, chat, turnState, aiResponse, turnForMaintenance, maintenanceConfig) => {
+        const entityNamesForMaintenance = Array.from(turnState.entitiesToConsolidate);
+        if (maintenanceConfig.debug) {
+            console.log(`[LIBRA] Scheduling background maintenance | turn=${turnForMaintenance} | entities=${entityNamesForMaintenance.length} | bgPending=${BackgroundMaintenanceQueue.pendingCount} | llmPending=${MaintenanceLLMQueue.pendingCount}`);
+        }
+        BackgroundMaintenanceQueue.enqueue(async () => {
+            const startedAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+            try {
+                const effectiveLoreForAuthor = MemoryEngine.getEffectiveLorebook(char, chat);
+                await Promise.allSettled([
+                    NarrativeTracker.summarizeIfNeeded(turnForMaintenance, maintenanceConfig),
+                    ...entityNamesForMaintenance.map(name =>
+                        CharacterStateTracker.consolidateIfNeeded(name, turnForMaintenance, maintenanceConfig)
+                    ),
+                    WorldStateTracker.consolidateIfNeeded(turnForMaintenance, maintenanceConfig)
+                ]);
+                try {
+                    await StoryAuthor.updatePlanIfNeeded(
+                        turnForMaintenance,
+                        maintenanceConfig,
+                        turnState.strictUserMsg,
+                        aiResponse,
+                        turnState.involvedEntities,
+                        effectiveLoreForAuthor
+                    );
+                } catch (e) {
+                    console.warn('[LIBRA] Story author background update failed:', e?.message || e);
+                }
+                try {
+                    await Director.updateDirective(
+                        turnForMaintenance,
+                        maintenanceConfig,
+                        turnState.strictUserMsg,
+                        aiResponse,
+                        turnState.involvedEntities,
+                        effectiveLoreForAuthor
+                    );
+                } catch (e) {
+                    console.warn('[LIBRA] Director background update failed:', e?.message || e);
+                }
+
+                await loreLock.writeLock();
+                try {
+                    const latestChar = await requireLoadedCharacter();
+                    const latestChat = latestChar.chats?.[latestChar.chatPage];
+                    if (!latestChat) return;
+                    const latestLore = [...MemoryEngine.getLorebook(latestChar, latestChat)];
+
+                    HierarchicalWorldManager.saveWorldGraphUnsafe(latestLore);
+                    await EntityManager.saveToLorebook(latestChar, latestChat, latestLore);
+                    await NarrativeTracker.saveState(latestLore);
+                    await StoryAuthor.saveState(latestLore);
+                    await Director.saveState(latestLore);
+                    await CharacterStateTracker.saveState(latestLore);
+                    await WorldStateTracker.saveState(latestLore);
+
+                    MemoryEngine.setLorebook(latestChar, latestChat, latestLore);
+                    await persistLoreToActiveChat(latestChat, latestLore, { saveCheckpoint: true });
+                } finally {
+                    loreLock.writeUnlock();
+                }
+                if (maintenanceConfig.debug) {
+                    const finishedAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                    console.log(`[LIBRA] Background maintenance complete | turn=${turnForMaintenance} | duration=${Math.max(0, Math.round(finishedAt - startedAt))}ms | llmPending=${MaintenanceLLMQueue.pendingCount} | llmActive=${MaintenanceLLMQueue.activeCount}`);
+                }
+            } catch (bgErr) {
+                console.error('[LIBRA] Background maintenance error:', bgErr?.message || bgErr);
+            }
+        }, `afterRequest-turn-${turnForMaintenance}`).catch(e => {
+            console.error('[LIBRA] Background maintenance queue error:', e?.message || e);
+        });
+    };
+
+    const PendingTurnManager = (() => {
+        const pruneStale = () => {
+            const now = Date.now();
+            for (const [key, pending] of MemoryState.pendingTurnCommits.entries()) {
+                if (!pending || (now - Number(pending.createdAt || now)) <= PENDING_STALE_MS) continue;
+                MemoryState.pendingTurnCommits.delete(key);
+            }
+        };
+
+        const getPending = (chat) => {
+            pruneStale();
+            return MemoryState.pendingTurnCommits.get(getChatMemoryScopeKey(chat)) || null;
+        };
+
+        const getPendingComparableHashes = (chat) => {
+            const pending = getPending(chat);
+            if (!pending?.aiHash) return new Set();
+            return new Set([pending.aiHash]);
+        };
+
+        const registerPending = (chat, payload) => {
+            if (!chat || !payload?.aiHash) return null;
+            const key = getChatMemoryScopeKey(chat);
+            const prev = MemoryState.pendingTurnCommits.get(key);
+            const next = {
+                ...payload,
+                chatId: chat?.id || null,
+                createdAt: Date.now(),
+                firstSeenAt: Date.now(),
+                lastSeenAt: 0,
+                stableMatches: prev?.aiHash === payload.aiHash ? Number(prev.stableMatches || 0) : 0,
+                observedMessageId: prev?.aiHash === payload.aiHash ? (prev.observedMessageId || null) : null,
+                observedHash: prev?.aiHash === payload.aiHash ? (prev.observedHash || null) : null
+            };
+            MemoryState.pendingTurnCommits.set(key, next);
+            enterRefreshRecoveryWindow();
+            return next;
+        };
+
+        const dropPending = (chat) => {
+            MemoryState.pendingTurnCommits.delete(getChatMemoryScopeKey(chat));
+        };
+
+        const finalizePending = async (char, chat, reason = 'stabilized') => {
+            const pending = getPending(chat);
+            if (!char || !chat || !pending) return { status: 'none' };
+
+            const latestAiMsg = findLatestAssistantMessage(chat);
+            if (latestAiMsg && pending.initialMessageId && latestAiMsg.id === pending.initialMessageId) {
+                return { status: 'waiting', reason: 'message_not_yet_added' };
+            }
+
+            const latestComparable = Utils.getNarrativeComparableText(Utils.getMessageText(latestAiMsg), 'ai');
+            const latestHash = latestComparable ? TokenizerEngine.simpleHash(latestComparable) : null;
+
+            if (!latestHash) {
+                return { status: 'waiting', reason: 'no_latest_hash' };
+            }
+
+            const now = Date.now();
+            pending.lastSeenAt = now;
+            if (pending.observedHash === latestHash) pending.stableMatches = Number(pending.stableMatches || 0) + 1;
+            else pending.stableMatches = 1;
+            pending.observedHash = latestHash;
+            pending.observedMessageId = latestAiMsg?.id || pending.observedMessageId || null;
+            pending.aiResponse = latestComparable;
+            MemoryState.pendingTurnCommits.set(getChatMemoryScopeKey(chat), pending);
+
+            if ((now - Number(pending.createdAt || now)) < PENDING_FINALIZE_MIN_MS) {
+                return { status: 'waiting', reason: 'age_guard' };
+            }
+            if (Number(pending.stableMatches || 0) < PENDING_FINALIZE_REQUIRED_MATCHES) {
+                return { status: 'waiting', reason: 'stability_guard' };
+            }
+
+            MemoryEngine.incrementTurn();
+            const currentTurn = MemoryEngine.getCurrentTurn();
+            const lore = MemoryEngine.getLorebook(char, chat);
+            const config = MemoryEngine.CONFIG;
+            const m_id = latestAiMsg?.id || pending.observedMessageId || null;
+            const allowNarrativeProcessing = pending.allowNarrativeProcessing !== false;
+            const allowMemoryCapture = pending.allowMemoryCapture !== false;
+            const turnState = allowNarrativeProcessing
+                ? await processNarrativeTurnState(char, chat, lore, pending.userMsgForNarrative, pending.aiResponse, m_id, {
+                    autoContinue: !!pending.autoContinueTurn
+                })
+                : {
+                    config,
+                    conversationEmotion: config.emotionEnabled
+                        ? EmotionEngine.analyze([pending.userMsgForNarrative, pending.aiResponse].filter(Boolean).join('\n'))
+                        : null,
+                    involvedEntities: [],
+                    entitiesToConsolidate: [],
+                    strictUserMsg: pending.userMsgForNarrative || '',
+                    recordedNarrativeTurn: false
+                };
+            const memoryImportance = config.emotionEnabled
+                ? EmotionEngine.boostImportance(5, turnState.conversationEmotion)
+                : 5;
+            const memoryContent = `[사용자] ${pending.userMsgForMemory || ''}\n[응답] ${pending.aiResponse}`;
+            const newMemory = allowMemoryCapture
+                ? await MemoryEngine.prepareMemory(
+                    { content: memoryContent, importance: memoryImportance },
+                    currentTurn, lore, lore, char, chat, m_id
+                )
+                : null;
+
+            if (newMemory) {
+                await loreLock.writeLock();
+                try {
+                    lore.push(newMemory);
+                    MemoryEngine.setLorebook(char, chat, lore);
+                    await persistLoreToActiveChat(chat, lore, { saveCheckpoint: true });
+                } finally {
+                    loreLock.writeUnlock();
+                }
+            }
+
+            if (m_id) {
+                const createdKeys = [];
+                if (newMemory) createdKeys.push(newMemory.key || TokenizerEngine.getSafeMapKey(newMemory.content));
+                MemoryState.rollbackTracker.set(m_id, {
+                    loreKeys: createdKeys,
+                    sourceHash: pending.aiHash
+                });
+                MemoryState.transientMissing.delete(m_id);
+            }
+
+            dropPending(chat);
+            if (allowNarrativeProcessing) {
+                scheduleTurnMaintenance(char, chat, turnState, pending.aiResponse, currentTurn, config);
+            }
+            if (config.debug) {
+                console.log(`[LIBRA] Pending turn finalized via ${reason} | turn=${currentTurn} | chat=${chat?.id || 'global'}`);
+            }
+            return { status: 'finalized', turn: currentTurn, memoryCreated: Boolean(newMemory) };
+        };
+
+        return { getPending, getPendingComparableHashes, registerPending, finalizePending, dropPending };
+    })();
+
+    const processNarrativeTurnState = async (char, chat, lore, userMsg, aiResponse, m_id = null, options = {}) => {
+        const config = MemoryEngine.CONFIG;
+        const strictUserMsg = getStrictNarrativeUserText(userMsg);
+        const conversationBaseText = [strictUserMsg, aiResponse].filter(Boolean).join('\n');
+        const conversationEmotion = config.emotionEnabled ? EmotionEngine.analyze(conversationBaseText) : null;
+        const conversationEmotionNote = config.emotionEnabled ? EmotionEngine.formatSummary(conversationEmotion, 0.35) : '';
+
+        const complexAnalysis = ComplexWorldDetector.analyze(strictUserMsg, aiResponse);
+
+        if (config.debug && complexAnalysis.hasComplexElements) {
+            console.log('[LIBRA] Complex indicators:', complexAnalysis.indicators);
+            console.log('[LIBRA] Dimensional shifts:', complexAnalysis.dimensionalShifts);
+        }
+
+        for (const shift of complexAnalysis.dimensionalShifts) {
+            if (!shift.to) continue;
+            const profile = HierarchicalWorldManager.getProfile();
+            if (!profile?.nodes) continue;
+            let targetNode = null;
+
+            for (const [id, node] of profile.nodes) {
+                if (node.name.includes(shift.to) || shift.to.includes(node.name)) {
+                    targetNode = node;
+                    break;
+                }
+            }
+
+            if (!targetNode) {
+                const createResult = HierarchicalWorldManager.createNode({
+                    name: shift.to,
+                    layer: 'dimension',
+                    parent: profile.rootId,
+                    source: 'auto_detected'
+                });
+                if (createResult.success) {
+                    targetNode = createResult.node;
+                    if (config.debug) console.log('[LIBRA] New dimension created:', shift.to);
+                }
+            }
+
+            if (targetNode) {
+                HierarchicalWorldManager.changeActivePath(targetNode.id, { method: shift.type });
+            }
+        }
+
+        const profile = HierarchicalWorldManager.getProfile();
+        if (complexAnalysis.indicators.multiverse && !profile.global.multiverse) {
+            profile.global.multiverse = true;
+            profile.global.dimensionTravel = true;
+        }
+        if (complexAnalysis.indicators.timeTravel) profile.global.timeTravel = true;
+        if (complexAnalysis.indicators.metaNarrative) profile.global.metaNarrative = true;
+
+        const storedInfo = EntityAwareProcessor.formatStoredInfo();
+        const entityResult = await EntityAwareProcessor.extractFromConversation(
+            strictUserMsg, aiResponse, storedInfo, config
+        );
+
+        if (entityResult.success) {
+            for (const entityData of entityResult.entities || []) {
+                if (!entityData.name) continue;
+                const consistency = EntityManager.checkConsistency(entityData.name, entityData, lore);
+                if (!consistency.consistent && config.debug) {
+                    console.warn(`[LIBRA] Entity consistency warning:`, consistency.conflicts);
+                }
+            }
+            await EntityAwareProcessor.applyExtractions(entityResult, lore, config, m_id);
+        }
+
+        const involvedEntities = (entityResult.success && entityResult.entities)
+            ? entityResult.entities.map(e => e.name).filter(Boolean)
+            : [];
+        const narrativeUserLabel = strictUserMsg || ((options.autoContinue && aiResponse) ? '[auto-continue]' : '');
+        const recordedNarrativeTurn = !!narrativeUserLabel;
+        if (recordedNarrativeTurn) {
+            await NarrativeTracker.recordTurn(MemoryEngine.getCurrentTurn(), narrativeUserLabel, aiResponse, involvedEntities, config);
+        }
+
+        const entitiesToConsolidate = new Set();
+        if (entityResult.success) {
+            for (const entityData of entityResult.entities || []) {
+                if (!entityData.name || !entityData.status) continue;
+                const statusForRecord = {
+                    ...entityData.status,
+                    notes: [entityData.status.notes || '', conversationEmotionNote].filter(Boolean).join(' | ')
+                };
+                const isCritical = CharacterStateTracker.isCriticalMoment(entityData.name, statusForRecord);
+                CharacterStateTracker.recordState(entityData.name, MemoryEngine.getCurrentTurn(), statusForRecord);
+                if (isCritical) {
+                    CharacterStateTracker.recordCriticalMoment(entityData.name, MemoryEngine.getCurrentTurn(),
+                        `Critical change: ${JSON.stringify(statusForRecord)}`);
+                }
+                entitiesToConsolidate.add(entityData.name);
+            }
+        }
+
+        const worldProfile = HierarchicalWorldManager.getProfile();
+        const currentRules = HierarchicalWorldManager.getCurrentRules();
+        const worldSnapshot = {
+            activePath: worldProfile?.activePath || [],
+            rules: currentRules,
+            global: worldProfile?.global || {},
+            notes: [
+                complexAnalysis.hasComplexElements ? `Complex: ${Object.keys(complexAnalysis.indicators).join(',')}` : '',
+                conversationEmotionNote
+            ].filter(Boolean).join(' | ')
+        };
+        const isWorldCritical = WorldStateTracker.isCriticalMoment(worldSnapshot);
+        WorldStateTracker.recordState(MemoryEngine.getCurrentTurn(), worldSnapshot);
+        if (isWorldCritical) {
+            WorldStateTracker.recordCriticalMoment(MemoryEngine.getCurrentTurn(),
+                `World path changed: ${(worldSnapshot.activePath || []).join('→')}`);
+        }
+
+        return {
+            config,
+            conversationEmotion,
+            entityResult,
+            involvedEntities,
+            entitiesToConsolidate: Array.from(entitiesToConsolidate),
+            strictUserMsg,
+            narrativeUserLabel,
+            recordedNarrativeTurn
+        };
+    };
 
     // ══════════════════════════════════════════════════════════════
     // [UTILITY] LRU Cache
@@ -1254,7 +3113,7 @@
         clear() { this.cache.clear(); this.hits = 0; this.misses = 0; }
         get stats() {
             const total = this.hits + this.misses;
-            return { size: this.cache.size, hitRate: total > 0 ? (this.hits / total).toFixed(3) : 0 };
+            return { size: this.cache.size, hitRate: total > 0 ? +(this.hits / total).toFixed(3) : 0 };
         }
     }
 
@@ -1286,13 +3145,41 @@
             return raw.replace(/\/$/, '') + normalizedSuffix;
         }
 
+        _appendApiKey(url, apiKey) {
+            const raw = String(url || '').trim();
+            if (!apiKey || raw.includes('key=')) return raw;
+            return `${raw}${raw.includes('?') ? '&' : '?'}key=${encodeURIComponent(apiKey)}`;
+        }
+
+        _extractTextParts(content) {
+            const parts = Array.isArray(content?.parts) ? content.parts : [];
+            return parts
+                .filter(part => part && !part.thought)
+                .map(part => String(part?.text || '').trim())
+                .filter(Boolean)
+                .join('\n\n');
+        }
+
         async _fetchRaw(url, requestInit, timeoutMs = 120000) {
+            let timeoutId = null;
             const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => reject(new LIBRAError('API Request timed out', 'TIMEOUT')), timeoutMs);
+                timeoutId = setTimeout(() => reject(new LIBRAError('API Request timed out', 'TIMEOUT')), timeoutMs);
             });
 
-            const fetchPromise = risuai.nativeFetch(url, requestInit);
-            return Promise.race([fetchPromise, timeoutPromise]);
+            const fetchPromise = (async () => {
+                const res = await risuai.nativeFetch(url, requestInit);
+                if (!res) {
+                    return { ok: false, status: 500, text: async () => 'RisuAI internal fetch error (undefined response)' };
+                }
+                return res;
+            })();
+            try {
+                return await Promise.race([fetchPromise, timeoutPromise]);
+            } finally {
+                if (timeoutId != null && typeof clearTimeout === 'function') {
+                    clearTimeout(timeoutId);
+                }
+            }
         }
 
         async _fetch(url, headers, body, timeoutMs = 120000) {
@@ -1304,9 +3191,10 @@
                 headers: headers,
                 body: JSON.stringify(body)
             }, timeoutMs);
-            if (!response.ok) {
-                const errorBody = await response.text().catch(() => 'No error body');
-                throw new LIBRAError(`API Error: ${response.status} - ${errorBody}`, 'API_ERROR');
+            if (!response || !response.ok) {
+                const status = response?.status || 'Unknown';
+                const errorBody = await response?.text().catch(() => 'No error body') || 'No response';
+                throw new LIBRAError(`API Error: ${status} - ${errorBody}`, 'API_ERROR');
             }
             return await response.json();
         }
@@ -1466,7 +3354,10 @@
     class GeminiProvider extends BaseProvider {
         async callLLM(config, systemPrompt, userContent, options) {
             this._checkKey(config.llm.key);
-            const url = `${config.llm.url.replace(/\/$/, '')}/models/${config.llm.model}:generateContent?key=${config.llm.key}`;
+            const baseUrl = String(config.llm.url || '').trim().replace(/\/$/, '');
+            this._checkUrl(baseUrl);
+            const modelPath = `/models/${config.llm.model}:generateContent`;
+            const url = this._appendApiKey(baseUrl.includes(':generateContent') ? baseUrl : `${baseUrl}${modelPath}`, config.llm.key);
             const body = {
                 contents: [{ role: "user", parts: [{ text: userContent }] }],
                 generationConfig: {
@@ -1482,48 +3373,151 @@
                     thinkingBudget: Math.max(0, parseInt(config.llm.reasoningBudgetTokens, 10) || 0)
                 };
             }
-            const data = await this._fetch(url, { 'Content-Type': 'application/json' }, body, config.llm.timeout);
-            return { content: data.candidates?.[0]?.content?.parts?.[0]?.text || '', usage: data.usage || {} };
+            const data = await this._fetch(url, { 'Content-Type': 'application/json', 'x-goog-api-key': config.llm.key }, body, config.llm.timeout);
+            return { content: this._extractTextParts(data.candidates?.[0]?.content) || '', usage: data.usageMetadata || data.usage || {} };
         }
 
         async getEmbedding(config, text) {
             this._checkKey(config.embed.key);
-            const url = `${config.embed.url.replace(/\/$/, '')}/models/${config.embed.model}:embedContent?key=${config.embed.key}`;
+            const baseUrl = String(config.embed.url || '').trim().replace(/\/$/, '');
+            this._checkUrl(baseUrl, 'Embedding API URL');
+            const modelPath = `/models/${config.embed.model}:embedContent`;
+            const url = this._appendApiKey(baseUrl.includes(':embedContent') ? baseUrl : `${baseUrl}${modelPath}`, config.embed.key);
             const body = {
                 model: `models/${config.embed.model}`,
                 content: { parts: [{ text: text }] }
             };
-            const data = await this._fetch(url, { 'Content-Type': 'application/json' }, body, config.embed.timeout);
+            const data = await this._fetch(url, { 'Content-Type': 'application/json', 'x-goog-api-key': config.embed.key }, body, config.embed.timeout);
             return data?.embedding?.values;
         }
     }
 
     class VertexAIProvider extends BaseProvider {
+        static _tokenCache = new Map();
+
+        static _str2ab(privateKey) {
+            const binaryString = atob(String(privateKey || '').replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\\n|\n/g, ''));
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+            return bytes.buffer;
+        }
+
+        static _base64url(source) {
+            let binary = '';
+            for (let i = 0; i < source.length; i++) {
+                binary += String.fromCharCode(source[i]);
+            }
+            return btoa(binary)
+                .replace(/=+$/, '')
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_');
+        }
+
+        static async _generateAccessToken(clientEmail, privateKey) {
+            const now = Math.floor(Date.now() / 1000);
+            const header = { alg: 'RS256', typ: 'JWT' };
+            const claimSet = {
+                iss: clientEmail,
+                scope: 'https://www.googleapis.com/auth/cloud-platform',
+                aud: 'https://oauth2.googleapis.com/token',
+                exp: now + 3600,
+                iat: now
+            };
+            const encodedHeader = VertexAIProvider._base64url(new TextEncoder().encode(JSON.stringify(header)));
+            const encodedClaimSet = VertexAIProvider._base64url(new TextEncoder().encode(JSON.stringify(claimSet)));
+            const key = await crypto.subtle.importKey(
+                'pkcs8',
+                VertexAIProvider._str2ab(privateKey),
+                { name: 'RSASSA-PKCS1-v1_5', hash: { name: 'SHA-256' } },
+                false,
+                ['sign']
+            );
+            const signature = await crypto.subtle.sign(
+                'RSASSA-PKCS1-v1_5',
+                key,
+                new TextEncoder().encode(`${encodedHeader}.${encodedClaimSet}`)
+            );
+            const jwt = `${encodedHeader}.${encodedClaimSet}.${VertexAIProvider._base64url(new Uint8Array(signature))}`;
+            const response = await risuai.nativeFetch('https://oauth2.googleapis.com/token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`
+            });
+            if (!response?.ok) {
+                const errText = await response?.text?.().catch(() => String(response?.status || 'Unknown')) || 'No response';
+                throw new Error(`Failed to get Vertex AI access token: ${errText}`);
+            }
+            const data = await response.json();
+            if (!data?.access_token) throw new Error('No access token in Vertex AI token response');
+            return data.access_token;
+        }
+
+        static async _getAccessToken(rawKey) {
+            const cacheKey = String(rawKey || '').trim();
+            const cached = VertexAIProvider._tokenCache.get(cacheKey);
+            if (cached?.token && Date.now() < cached.expiry) return cached.token;
+            let clientEmail = '';
+            let privateKey = '';
+            try {
+                const credentials = JSON.parse(cacheKey);
+                clientEmail = credentials.client_email;
+                privateKey = credentials.private_key;
+            } catch {
+                throw new Error('Vertex AI Key must be a JSON service account credential. e.g. {"client_email":"...","private_key":"..."}');
+            }
+            if (!clientEmail || !privateKey) {
+                throw new Error('Vertex AI credentials missing client_email or private_key');
+            }
+            const token = await VertexAIProvider._generateAccessToken(clientEmail, privateKey);
+            VertexAIProvider._tokenCache.set(cacheKey, { token, expiry: Date.now() + 3500 * 1000 });
+            return token;
+        }
+
         async callLLM(config, systemPrompt, userContent, options) {
             this._checkKey(config.llm.key);
+            const baseUrl = String(config.llm.url || '').trim().replace(/\/$/, '');
+            this._checkUrl(baseUrl);
+            const model = String(config.llm.model || '').trim();
+            const accessToken = await VertexAIProvider._getAccessToken(config.llm.key);
+            const isThinkingModel = /gemini-(3|2\.5)/i.test(model);
+            const requestedTokens = options.maxTokens || 1000;
+            const maxOutputTokens = isThinkingModel ? Math.max(requestedTokens, 8192) : requestedTokens;
             const body = {
                 contents: [{ role: "user", parts: [{ text: userContent }] }],
-                generationConfig: { temperature: config.llm.temp || 0.3, maxOutputTokens: options.maxTokens || 1000 }
+                generationConfig: { temperature: config.llm.temp || 0.3, maxOutputTokens: maxOutputTokens }
             };
             if (systemPrompt) {
                 body.systemInstruction = { parts: [{ text: systemPrompt }] };
             }
-            if ((config.llm.reasoningBudgetTokens || 0) > 0) {
+            if (isThinkingModel) {
+                body.generationConfig.thinkingConfig = { includeThoughts: false };
+                if ((config.llm.reasoningBudgetTokens || 0) > 0) {
+                    body.generationConfig.thinkingConfig.thinkingBudget = Math.max(0, parseInt(config.llm.reasoningBudgetTokens, 10) || 0);
+                }
+            } else if ((config.llm.reasoningBudgetTokens || 0) > 0) {
                 body.generationConfig.thinkingConfig = {
                     thinkingBudget: Math.max(0, parseInt(config.llm.reasoningBudgetTokens, 10) || 0)
                 };
             }
-            const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.llm.key}` };
-            const data = await this._fetch(config.llm.url, headers, body, config.llm.timeout);
-            return { content: data.candidates?.[0]?.content?.parts?.[0]?.text || '', usage: data.usage || {} };
+            const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${accessToken}` };
+            const url = baseUrl.includes(':generateContent') ? baseUrl : `${baseUrl}/${model}:generateContent`;
+            const data = await this._fetch(url, headers, body, config.llm.timeout);
+            return { content: this._extractTextParts(data.candidates?.[0]?.content) || '', usage: data.usageMetadata || data.usage || {} };
         }
 
         async getEmbedding(config, text) {
             this._checkKey(config.embed.key);
-            const body = { instances: [{ content: text }] };
-            const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.embed.key}` };
+            this._checkUrl(config.embed.url, 'Embedding API URL');
+            const accessToken = await VertexAIProvider._getAccessToken(config.embed.key);
+            const body = {
+                instances: [{ content: text }],
+                parameters: { autoTruncate: true }
+            };
+            const headers = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${accessToken}` };
             const data = await this._fetch(config.embed.url, headers, body, config.embed.timeout);
-            return data?.predictions?.[0]?.embeddings?.values;
+            return data?.predictions?.[0]?.embeddings?.values
+                || data?.embedding?.values
+                || data?.embeddings?.[0]?.values;
         }
     }
 
@@ -1550,11 +3544,6 @@
         sim_small: { maxLimit: 220, threshold: 5, simThreshold: 0.26, gcBatchSize: 6 },
         sim_medium: { maxLimit: 360, threshold: 4, simThreshold: 0.20, gcBatchSize: 8 },
         sim_large: { maxLimit: 560, threshold: 3, simThreshold: 0.15, gcBatchSize: 12 }
-    };
-    const COLD_START_SCOPE_PRESETS = {
-        all: 0,
-        partial_100: 100,
-        partial_300: 300
     };
     const WEIGHT_MODE_PRESETS = {
         auto: { similarity: 0.5, importance: 0.3, recency: 0.2 },
@@ -1605,15 +3594,6 @@
         return 'custom';
     };
 
-    const resolveColdStartHistoryLimit = (preset, fallbackLimit = 100) => {
-        const normalized = String(preset || '').toLowerCase();
-        if (Object.prototype.hasOwnProperty.call(COLD_START_SCOPE_PRESETS, normalized)) {
-            return COLD_START_SCOPE_PRESETS[normalized];
-        }
-        const parsedFallback = Number(fallbackLimit);
-        return Number.isFinite(parsedFallback) ? Math.max(0, parsedFallback) : 100;
-    };
-
     const inferColdStartScopePreset = (limit) => {
         const normalizedLimit = Math.max(0, Number(limit) || 0);
         for (const [key, value] of Object.entries(COLD_START_SCOPE_PRESETS)) {
@@ -1636,7 +3616,7 @@
 
         const getSafeMapKey = (text) => {
             const t = text || "";
-            return`${simpleHash(t)}_${t.slice(0, 8)}_${t.slice(-4)}`;
+            return `${simpleHash(t)}_${t.slice(0, 8)}_${t.slice(-4)}`;
         };
 
         const tokenize = (t) =>
@@ -1659,8 +3639,10 @@
 
         const estimateTokens = (text, type = 'simple') => {
             if (!text) return 0;
-            const ratio = type === 'gpt4' ? 0.5 : 0.6;
-            return Math.ceil(text.length * ratio) + (text.match(/\s/g) || []).length;
+            const cjkCount = (text.match(/[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f\uac00-\ud7af]/g) || []).length;
+            const nonCjk = text.length - cjkCount;
+            const ratio = type === 'gpt4' ? 0.45 : 0.55;
+            return Math.ceil(nonCjk * ratio + cjkCount * 1.8) + (text.match(/\s/g) || []).length;
         };
 
         return { simpleHash, tokenize, getIndexKey, getSafeMapKey, estimateTokens };
@@ -1703,6 +3685,7 @@
         const NEGATION_WORDS_EN = ['not', 'no', 'never', 'neither', 'hardly', 'barely', 'cannot', "can't", "don't", "doesn't", "didn't", "won't", "isn't", "aren't"];
         const NEGATION_WORDS_JA = ['ない', 'じゃない', 'ではない', 'ません', 'ぬ', 'ず', 'なかった', '嫌いじゃない'];
         const NEGATION_WINDOW = 10;
+        const DOMINANT_PRIORITY = ['affection', 'joy', 'sadness', 'fear', 'surprise', 'anger', 'disgust'];
 
         const hasNegationNearby = (text, matchIndex) => {
             const start = Math.max(0, matchIndex - NEGATION_WINDOW);
@@ -1719,15 +3702,26 @@
         const analyze = (text) => {
             const lowerText = (text || "").toLowerCase();
             let score = 0;
-            const emotions = { joy: 0, sadness: 0, anger: 0, fear: 0, surprise: 0, disgust: 0 };
+            const emotions = { affection: 0, joy: 0, sadness: 0, anger: 0, fear: 0, surprise: 0, disgust: 0 };
 
             const keywords = {
+                affection: ['애틋', '애절', '다정', '다정하', '따뜻', '포근', '소중', '아끼', '그리워', '보고 싶', '보고싶', '안아', '껴안', '손잡', '입맞', '키스', '사랑', '좋아하', '설레', '두근', '떨리', '애정', '위로', '보듬', 'tender', 'affection', 'affectionate', 'longing', 'yearning', 'cherish', 'gentle', 'care for', 'caring', 'miss you', 'hold hands', 'hug', 'embrace', 'love', 'fond', '切な', '愛し', '恋し', '会いた', '抱きし', '手を握', '優し', '大切', 'ぬくも', '恋'],
                 joy: ['기쁘', '행복', '좋아', '웃', '미소', '즐거', 'happy', 'joy', 'glad', 'smile', 'laugh', 'delighted', '嬉し', '幸せ', '好き', '笑', '楽しい', '喜び'],
-                sadness: ['슬프', '우울', '눈물', '울', '그리워', 'sad', 'depressed', 'tears', 'cry', 'miss', '悲し', 'つら', '辛い', '涙', '泣', '寂し'],
+                sadness: ['슬프', '우울', '눈물', '울', 'sad', 'depressed', 'tears', 'cry', 'miss', '悲し', 'つら', '辛い', '涙', '泣', '寂し'],
                 anger: ['화나', '분노', '짜증', '열받', 'angry', 'furious', 'rage', 'annoyed', 'irritated', '怒', '腹立', '苛立', 'むかつ', 'イライラ'],
                 fear: ['무서', '두려', '공포', '불안', 'scared', 'afraid', 'fear', 'anxious', 'terrified', '怖', '恐', '不安', '怯え', '震え'],
                 surprise: ['놀라', '충격', '깜짝', 'surprised', 'shocked', 'astonished', 'startled', '驚', 'びっくり', '仰天', 'ショック'],
                 disgust: ['역겨', '혐오', '싫어', 'disgusted', 'hate', 'loathe', 'revolted', '嫌', '気持ち悪', 'うんざり', '吐き気', '最悪']
+            };
+
+            const keywordWeights = {
+                affection: 1.2,
+                joy: 1.0,
+                sadness: 1.0,
+                anger: 0.9,
+                fear: 1.0,
+                surprise: 0.9,
+                disgust: 1.0
             };
 
             for (const [emotion, words] of Object.entries(keywords)) {
@@ -1735,15 +3729,29 @@
                     let idx = lowerText.indexOf(word);
                     while (idx !== -1) {
                         if (!hasNegationNearby(lowerText, idx)) {
-                            emotions[emotion]++;
-                            score++;
+                            emotions[emotion] += keywordWeights[emotion] || 1;
+                            score += keywordWeights[emotion] || 1;
                         }
                         idx = lowerText.indexOf(word, idx + 1);
                     }
                 }
             }
 
-            const dominant = Object.entries(emotions).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1])[0];
+            // 애틋함/그리움이 강한 문맥에서는 분노보다 관계 감정을 우선 반영
+            if (emotions.affection > 0) {
+                if (emotions.anger > 0 && emotions.affection >= emotions.anger) {
+                    emotions.anger = Math.max(0, emotions.anger - (emotions.affection * 0.75));
+                }
+                emotions.joy += emotions.affection * 0.35;
+                emotions.sadness += emotions.affection * 0.25;
+            }
+
+            const dominant = Object.entries(emotions)
+                .filter(([, s]) => s > 0)
+                .sort((a, b) => {
+                    if (b[1] !== a[1]) return b[1] - a[1];
+                    return DOMINANT_PRIORITY.indexOf(a[0]) - DOMINANT_PRIORITY.indexOf(b[0]);
+                })[0];
             return {
                 scores: emotions,
                 dominant: dominant ? dominant[0] : 'neutral',
@@ -1762,7 +3770,7 @@
             let bonus = 0;
             if ((result.intensity || 0) >= 0.35) bonus += 1;
             if ((result.intensity || 0) >= 0.65) bonus += 1;
-            if (['fear', 'anger', 'surprise', 'sadness'].includes(result.dominant)) bonus += 1;
+            if (['fear', 'anger', 'surprise', 'sadness', 'affection'].includes(result.dominant)) bonus += 1;
             return Math.max(1, Math.min(10, base + bonus));
         };
 
@@ -1772,34 +3780,62 @@
     // ══════════════════════════════════════════════════════════════
     // [API] LLM Provider
     // ══════════════════════════════════════════════════════════════
+    const getLLMProfileConfig = (config, profile = 'primary') => {
+        const baseConfig = config || {};
+        const primary = baseConfig.llm || {};
+        const aux = (baseConfig.auxLlm && baseConfig.auxLlm.enabled) ? baseConfig.auxLlm : {};
+        const wantsAux = String(profile || 'primary').toLowerCase() === 'aux';
+        const hasAux = !!String(aux.key || '').trim();
+        const selected = wantsAux && hasAux
+            ? {
+                ...primary,
+                ...aux,
+                provider: aux.provider || primary.provider,
+                url: aux.url || primary.url,
+                key: aux.key || primary.key,
+                model: aux.model || primary.model
+            }
+            : primary;
+        return {
+            config: { ...baseConfig, llm: { ...selected } },
+            profile: wantsAux && hasAux ? 'aux' : 'primary'
+        };
+    };
+    const isLLMProfileConfigured = (config, profile = 'primary') => {
+        if (!config?.useLLM) return false;
+        const resolved = getLLMProfileConfig(config, profile);
+        return !!String(resolved?.config?.llm?.key || '').trim();
+    };
     const LLMProvider = (() => {
         const call = async (config, systemPrompt, userContent, options = {}) => {
-            if (!config.useLLM || !config.llm?.key) {
+            const resolved = getLLMProfileConfig(config, options.profile || 'primary');
+            const activeConfig = resolved.config;
+            if (!activeConfig.useLLM || !activeConfig.llm?.key) {
                 return { content: null, skipped: true, reason: 'LLM not configured' };
             }
 
             try {
-                const providerName = config.llm.provider || 'openai';
+                const providerName = activeConfig.llm.provider || 'openai';
                 const provider = AutoProvider.get(providerName);
-                const debugLabel = options.debugLabel || options.label || 'generic';
+                const debugLabel = options.debugLabel || options.label || `${resolved.profile}-generic`;
                 const startAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
-                if (config.debug) {
+                if (activeConfig.debug) {
                     console.log(
-                        `[LIBRA][LLM] start | label=${debugLabel} | provider=${providerName} | model=${config.llm.model || ''} | url=${config.llm.url || ''} | systemChars=${String(systemPrompt || '').length} | userChars=${String(userContent || '').length}`
+                        `[LIBRA][LLM] start | label=${debugLabel} | profile=${resolved.profile} | provider=${providerName} | model=${activeConfig.llm.model || ''} | url=${activeConfig.llm.url || ''} | systemChars=${String(systemPrompt || '').length} | userChars=${String(userContent || '').length}`
                     );
                 }
-                const result = await provider.callLLM(config, systemPrompt, userContent, options);
-                if (config.debug) {
+                const result = await provider.callLLM(activeConfig, systemPrompt, userContent, options);
+                if (activeConfig.debug) {
                     const endAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
                     console.log(
-                        `[LIBRA][LLM] success | label=${debugLabel} | provider=${providerName} | duration=${Math.max(0, Math.round(endAt - startAt))}ms | contentChars=${String(result?.content || '').length}`
+                        `[LIBRA][LLM] success | label=${debugLabel} | profile=${resolved.profile} | provider=${providerName} | duration=${Math.max(0, Math.round(endAt - startAt))}ms | contentChars=${String(result?.content || '').length}`
                     );
                 }
                 return result;
             } catch (e) {
-                if (config.debug) {
+                if (activeConfig.debug) {
                     console.warn(
-                        `[LIBRA][LLM] fail | provider=${config.llm?.provider || 'openai'} | model=${config.llm?.model || ''} | url=${config.llm?.url || ''} | error=${e?.message || e}`
+                        `[LIBRA][LLM] fail | profile=${resolved.profile} | provider=${activeConfig.llm?.provider || 'openai'} | model=${activeConfig.llm?.model || ''} | url=${activeConfig.llm?.url || ''} | error=${e?.message || e}`
                     );
                 }
                 console.error('[LIBRA] LLM Provider Error:', e?.message || e);
@@ -1807,7 +3843,7 @@
             }
         };
 
-        return { call };
+        return { call, isConfigured: isLLMProfileConfigured };
     })();
 
     // ══════════════════════════════════════════════════════════════
@@ -1921,10 +3957,11 @@
         const deepMerge = (target, source) => {
             const result = { ...target };
             for (const key in source) {
-                if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
-                    result[key] = deepMerge(result[key] || {}, source[key]);
-                } else if (Array.isArray(source[key])) {
-                    result[key] = [...new Set([...(result[key] || []), ...source[key]])];
+                if (Array.isArray(source[key])) {
+                    result[key] = [...new Set([...(Array.isArray(result[key]) ? result[key] : []), ...source[key]])];
+                } else if (source[key] && typeof source[key] === 'object') {
+                    const nextTarget = (result[key] && typeof result[key] === 'object' && !Array.isArray(result[key])) ? result[key] : {};
+                    result[key] = deepMerge(nextTarget, source[key]);
                 } else {
                     result[key] = source[key];
                 }
@@ -1932,14 +3969,7 @@
             return result;
         };
 
-        const deepClone = (obj) => {
-            if (!obj) return obj;
-            try {
-                return typeof structuredClone === 'function' ? structuredClone(obj) : JSON.parse(JSON.stringify(obj));
-            } catch {
-                return obj;
-            }
-        };
+        const deepClone = safeClone;
 
         const loadWorldGraph = (lorebook, force = false) => {
             if (profile && !force) return profile;
@@ -2250,22 +4280,33 @@
         const RELATION_COMMENT = "lmai_relation";
         const RELATION_DELTA_SCALE = 0.5;
         const MAX_ROLLBACK_SNAPSHOTS = 12;
+        let identityState = {
+            userCanonical: 'User',
+            userAliases: new Set(['user', '사용자', 'you', 'me', '나', '본인'])
+        };
 
-        const normalizeName = (name) => {
+        const normalizeBaseName = (name) => {
             if (!name) return '';
+            let normalized = String(name || '')
+                .replace(/[“”"'`‘’]/g, '')
+                .replace(/\([^)]*\)/g, ' ')
+                .replace(/\[[^\]]*\]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
             const koTitles = ['선생님', '교수님', '박사님', '씨', '님', '양', '군'];
             const enTitles = ['Mr.', 'Mrs.', 'Ms.', 'Miss', 'Dr.', 'Prof.', 'Sir', 'Lady', 'Lord'];
-            let normalized = name.trim();
-            // Remove Korean suffixed titles (longest match first, break after first match)
             for (const title of koTitles) {
                 if (normalized.endsWith(title) && normalized.length > title.length + 1) {
-                    normalized = normalized.slice(0, -title.length);
+                    normalized = normalized.slice(0, -title.length).trim();
                     break;
                 }
             }
-            // Remove English prefixed titles
             for (const title of enTitles) {
-                if (normalized.startsWith(title + ' ') || normalized.startsWith(title)) {
+                const needsBoundary = !title.endsWith('.');
+                const hasTitlePrefix = normalized.startsWith(title + ' ')
+                    || (!needsBoundary && normalized.startsWith(title))
+                    || normalized === title;
+                if (hasTitlePrefix) {
                     normalized = normalized.slice(title.length).trim();
                     break;
                 }
@@ -2273,9 +4314,144 @@
             return normalized.trim();
         };
 
-        const makeRelationId = (nameA, nameB) => {
-            const sorted = [normalizeName(nameA), normalizeName(nameB)].sort();
-            return`${sorted[0]}_${sorted[1]}`;
+        const getKoreanShortName = (name) => {
+            const base = normalizeBaseName(name);
+            if (!/^[가-힣]{3,4}$/.test(base)) return '';
+            return base.slice(-2);
+        };
+
+        const getEnglishOrJapaneseNameParts = (name) => {
+            const base = normalizeBaseName(name);
+            if (!base) return [];
+            const spaceParts = base.split(/\s+/).filter(Boolean);
+            if (spaceParts.length >= 2) {
+                return spaceParts;
+            }
+            if (/[・·]/.test(base)) {
+                return base.split(/[・·]/).map(v => v.trim()).filter(Boolean);
+            }
+            return [];
+        };
+
+        const buildAliasCandidates = (name, includeShortKorean = true) => {
+            const base = normalizeBaseName(name);
+            if (!base) return [];
+            const compact = base.replace(/\s+/g, '');
+            const aliases = new Set([base, compact, base.toLowerCase(), compact.toLowerCase()]);
+            if (includeShortKorean) {
+                const shortKo = getKoreanShortName(base);
+                if (shortKo) {
+                    aliases.add(shortKo);
+                    aliases.add(shortKo.toLowerCase());
+                }
+            }
+            return [...aliases].filter(Boolean);
+        };
+
+        const refreshIdentity = (char, db) => {
+            const aliases = new Set(['user', '사용자', 'you', 'me', '나', '본인']);
+            const configuredUserName = normalizeBaseName(db?.username || '');
+            const personaName = normalizeBaseName(db?.personas?.[db?.selectedPersona || 0]?.name || '');
+            const canonical = configuredUserName || personaName || identityState.userCanonical || 'User';
+            buildAliasCandidates(canonical, true).forEach(alias => aliases.add(alias));
+            if (personaName) buildAliasCandidates(personaName, true).forEach(alias => aliases.add(alias));
+            identityState = {
+                userCanonical: canonical,
+                userAliases: aliases
+            };
+            return identityState;
+        };
+
+        const isUserAlias = (name) => {
+            const aliases = buildAliasCandidates(name, true);
+            return aliases.some(alias => identityState.userAliases.has(alias));
+        };
+
+        const extractEntityAliases = (entity) => {
+            const aliases = new Set();
+            buildAliasCandidates(entity?.name || '', true).forEach(alias => aliases.add(alias));
+            for (const part of getEnglishOrJapaneseNameParts(entity?.name || '')) {
+                buildAliasCandidates(part, false).forEach(alias => aliases.add(alias));
+            }
+            const metaAliases = Array.isArray(entity?.meta?.aliases) ? entity.meta.aliases : [];
+            for (const alias of metaAliases) {
+                buildAliasCandidates(alias, true).forEach(candidate => aliases.add(candidate));
+            }
+            return [...aliases].filter(Boolean);
+        };
+
+        const collectKnownEntities = (lorebook) => {
+            // If entityCache is populated (after rebuildCache), use it directly to avoid
+            // redundant lorebook parsing and duplicate entries
+            if (entityCache.size > 0) {
+                return Array.from(entityCache.values());
+            }
+            // Fallback: parse lorebook entries when cache is not yet built
+            const known = [];
+            for (const entry of Array.isArray(lorebook) ? lorebook : []) {
+                if (entry.comment !== ENTITY_COMMENT) continue;
+                try {
+                    known.push(JSON.parse(entry.content || '{}'));
+                } catch (e) {
+                    if (typeof MemoryEngine !== 'undefined' && MemoryEngine.CONFIG?.debug) {
+                        console.warn('[LIBRA] collectKnownEntities parse error:', e?.message);
+                    }
+                }
+            }
+            return known;
+        };
+
+        const resolveCanonicalName = (name, lorebook = []) => {
+            const base = normalizeBaseName(name);
+            if (!base) return '';
+            if (isUserAlias(base)) return identityState.userCanonical || base;
+
+            const incomingAliases = new Set(buildAliasCandidates(base, true));
+            const knownEntities = collectKnownEntities(lorebook);
+            const exactAliasMatch = knownEntities.find(entity => {
+                const entityAliases = extractEntityAliases(entity);
+                return entityAliases.some(alias => incomingAliases.has(alias));
+            });
+            if (exactAliasMatch?.name) {
+                return normalizeBaseName(exactAliasMatch.name);
+            }
+
+            const shortKo = getKoreanShortName(base) || (/^[가-힣]{2}$/.test(base) ? base : '');
+            if (shortKo) {
+                const matches = knownEntities
+                    .map(entity => normalizeBaseName(entity?.name || ''))
+                    .filter(entityName => /^[가-힣]{3,4}$/.test(entityName) && entityName.endsWith(shortKo));
+                const uniqueMatches = [...new Set(matches)];
+                if (uniqueMatches.length === 1) return uniqueMatches[0];
+            }
+
+            const jpEnBase = normalizeBaseName(base);
+            const jpEnIsSingleToken = getEnglishOrJapaneseNameParts(jpEnBase).length === 0
+                && !/\s/.test(jpEnBase)
+                && /[A-Za-z\u3040-\u30ff\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff]/.test(jpEnBase);
+            if (jpEnIsSingleToken) {
+                const matches = knownEntities
+                    .map(entity => normalizeBaseName(entity?.name || ''))
+                    .filter(Boolean)
+                    .filter(entityName => {
+                        const parts = getEnglishOrJapaneseNameParts(entityName);
+                        if (parts.length < 2) return false;
+                        return parts.some(part => normalizeBaseName(part).toLowerCase() === jpEnBase.toLowerCase());
+                    });
+                const uniqueMatches = [...new Set(matches)];
+                if (uniqueMatches.length === 1) return uniqueMatches[0];
+            }
+
+            return base;
+        };
+
+        const normalizeName = (name, lorebook = []) => {
+            return resolveCanonicalName(name, lorebook);
+        };
+
+        const makeRelationId = (nameA, nameB, lorebook = []) => {
+            const sorted = [normalizeName(nameA, lorebook), normalizeName(nameB, lorebook)].sort();
+            return `${sorted[0]}_${sorted[1]}`;
         };
 
         const addSourceMessageId = (meta, m_id) => {
@@ -2286,13 +4462,7 @@
             meta.m_id = m_id;
         };
 
-        const deepClone = (value) => {
-            try {
-                return JSON.parse(JSON.stringify(value));
-            } catch {
-                return value;
-            }
-        };
+        const deepClone = safeClone;
 
         const trimRollbackSnapshots = (snapshots) => {
             if (!snapshots || typeof snapshots !== 'object') return {};
@@ -2340,7 +4510,7 @@
 
             const state = deepClone(snapshot.state);
             if (Object.prototype.hasOwnProperty.call(state, 'appearance')) target.appearance = state.appearance || { features: [], distinctiveMarks: [], clothing: [] };
-            if (Object.prototype.hasOwnProperty.call(state, 'personality')) target.personality = state.personality || { traits: [], values: [], fears: [], likes: [], dislikes: [] };
+            if (Object.prototype.hasOwnProperty.call(state, 'personality')) target.personality = state.personality || { traits: [], values: [], fears: [], likes: [], dislikes: [], sexualOrientation: '', sexualPreferences: [] };
             if (Object.prototype.hasOwnProperty.call(state, 'background')) target.background = state.background || { origin: '', occupation: '', history: [], secrets: [] };
             if (Object.prototype.hasOwnProperty.call(state, 'status')) target.status = state.status || { currentLocation: '', currentMood: '', healthStatus: '', lastUpdated: 0 };
             if (Object.prototype.hasOwnProperty.call(state, 'relationType')) target.relationType = state.relationType || target.relationType;
@@ -2391,6 +4561,103 @@
             return relation;
         };
 
+        const normalizeFiniteNumber = (value, fallback = 0) => {
+            const numeric = Number(value);
+            return Number.isFinite(numeric) ? numeric : fallback;
+        };
+
+        const mergeEntityRecords = (baseEntity, incomingEntity) => {
+            if (!baseEntity) return incomingEntity;
+            if (!incomingEntity) return baseEntity;
+            baseEntity.meta = baseEntity.meta || {};
+            incomingEntity.meta = incomingEntity.meta || {};
+            const aliasSet = new Set([
+                ...(Array.isArray(baseEntity.meta.aliases) ? baseEntity.meta.aliases : []),
+                ...(Array.isArray(incomingEntity.meta.aliases) ? incomingEntity.meta.aliases : []),
+                normalizeBaseName(baseEntity.name || ''),
+                normalizeBaseName(incomingEntity.name || '')
+            ].filter(Boolean));
+            baseEntity.meta.aliases = [...aliasSet];
+
+            for (const key of ['features', 'distinctiveMarks', 'clothing']) {
+                baseEntity.appearance = baseEntity.appearance || {};
+                incomingEntity.appearance = incomingEntity.appearance || {};
+                const merged = new Set([...(baseEntity.appearance[key] || []), ...(incomingEntity.appearance[key] || [])].filter(Boolean));
+                baseEntity.appearance[key] = [...merged];
+            }
+            for (const key of ['traits', 'values', 'fears', 'likes', 'dislikes', 'sexualPreferences']) {
+                baseEntity.personality = baseEntity.personality || {};
+                incomingEntity.personality = incomingEntity.personality || {};
+                const merged = new Set([...(baseEntity.personality[key] || []), ...(incomingEntity.personality[key] || [])].filter(Boolean));
+                baseEntity.personality[key] = [...merged];
+            }
+            if (!baseEntity.personality.sexualOrientation && incomingEntity.personality?.sexualOrientation) {
+                baseEntity.personality.sexualOrientation = incomingEntity.personality.sexualOrientation;
+            }
+            baseEntity.background = baseEntity.background || {};
+            incomingEntity.background = incomingEntity.background || {};
+            if (!baseEntity.background.origin && incomingEntity.background.origin) baseEntity.background.origin = incomingEntity.background.origin;
+            if (!baseEntity.background.occupation && incomingEntity.background.occupation) baseEntity.background.occupation = incomingEntity.background.occupation;
+            const mergedHistory = new Set([...(baseEntity.background.history || []), ...(incomingEntity.background.history || [])].filter(Boolean));
+            baseEntity.background.history = [...mergedHistory];
+            baseEntity.status = baseEntity.status || {};
+            incomingEntity.status = incomingEntity.status || {};
+            if (!baseEntity.status.currentLocation && incomingEntity.status.currentLocation) baseEntity.status.currentLocation = incomingEntity.status.currentLocation;
+            if (!baseEntity.status.currentMood && incomingEntity.status.currentMood) baseEntity.status.currentMood = incomingEntity.status.currentMood;
+            if (!baseEntity.status.healthStatus && incomingEntity.status.healthStatus) baseEntity.status.healthStatus = incomingEntity.status.healthStatus;
+            baseEntity.meta.created = Math.min(
+                normalizeFiniteNumber(baseEntity.meta.created, Infinity),
+                normalizeFiniteNumber(incomingEntity.meta.created, Infinity)
+            );
+            if (!Number.isFinite(baseEntity.meta.created)) baseEntity.meta.created = 0;
+            baseEntity.meta.updated = Math.max(
+                normalizeFiniteNumber(baseEntity.meta.updated, 0),
+                normalizeFiniteNumber(incomingEntity.meta.updated, 0)
+            );
+            baseEntity.meta.confidence = Math.max(
+                normalizeFiniteNumber(baseEntity.meta.confidence, 0),
+                normalizeFiniteNumber(incomingEntity.meta.confidence, 0)
+            );
+            return baseEntity;
+        };
+
+        const mergeRelationRecords = (baseRelation, incomingRelation) => {
+            if (!baseRelation) return incomingRelation;
+            if (!incomingRelation) return baseRelation;
+            if (!baseRelation.relationType && incomingRelation.relationType) baseRelation.relationType = incomingRelation.relationType;
+            baseRelation.details = baseRelation.details || {};
+            incomingRelation.details = incomingRelation.details || {};
+            if (!baseRelation.details.howMet && incomingRelation.details.howMet) baseRelation.details.howMet = incomingRelation.details.howMet;
+            if (!baseRelation.details.duration && incomingRelation.details.duration) baseRelation.details.duration = incomingRelation.details.duration;
+            baseRelation.details.closeness = Math.max(Number(baseRelation.details.closeness || 0), Number(incomingRelation.details.closeness || 0));
+            baseRelation.details.trust = Math.max(Number(baseRelation.details.trust || 0), Number(incomingRelation.details.trust || 0));
+            const mergedEvents = [...(baseRelation.details.events || []), ...(incomingRelation.details.events || [])];
+            baseRelation.details.events = mergedEvents.slice(-20);
+            baseRelation.sentiments = baseRelation.sentiments || {};
+            incomingRelation.sentiments = incomingRelation.sentiments || {};
+            if (!baseRelation.sentiments.fromAtoB && incomingRelation.sentiments.fromAtoB) baseRelation.sentiments.fromAtoB = incomingRelation.sentiments.fromAtoB;
+            if (!baseRelation.sentiments.fromBtoA && incomingRelation.sentiments.fromBtoA) baseRelation.sentiments.fromBtoA = incomingRelation.sentiments.fromBtoA;
+            baseRelation.sentiments.currentTension = Math.max(Number(baseRelation.sentiments.currentTension || 0), Number(incomingRelation.sentiments.currentTension || 0));
+            baseRelation.sentiments.lastInteraction = Math.max(Number(baseRelation.sentiments.lastInteraction || 0), Number(incomingRelation.sentiments.lastInteraction || 0));
+            baseRelation.meta = baseRelation.meta || {};
+            incomingRelation.meta = incomingRelation.meta || {};
+            baseRelation.meta.created = Math.min(
+                normalizeFiniteNumber(baseRelation.meta.created, Infinity),
+                normalizeFiniteNumber(incomingRelation.meta.created, Infinity)
+            );
+            if (!Number.isFinite(baseRelation.meta.created)) baseRelation.meta.created = 0;
+            baseRelation.meta.updated = Math.max(
+                normalizeFiniteNumber(baseRelation.meta.updated, 0),
+                normalizeFiniteNumber(incomingRelation.meta.updated, 0)
+            );
+            baseRelation.meta.confidence = Math.max(
+                normalizeFiniteNumber(baseRelation.meta.confidence, 0),
+                normalizeFiniteNumber(incomingRelation.meta.confidence, 0)
+            );
+            harmonizeRelationMetrics(baseRelation);
+            return baseRelation;
+        };
+
         const buildEntityMentionRegex = (name) => {
             const escaped = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             const latinName = /^[a-z0-9 .'-]+$/i.test(name);
@@ -2402,28 +4669,61 @@
 
         const mentionsEntity = (text, entityOrName) => {
             const rawText = String(text || '').trim();
-            const normalizedName = normalizeName(typeof entityOrName === 'string' ? entityOrName : entityOrName?.name || '');
-            if (!rawText || !normalizedName || normalizedName.length < 2) return false;
+            const entity = typeof entityOrName === 'string' ? { name: entityOrName } : (entityOrName || {});
+            const candidates = extractEntityAliases(entity)
+                .map(alias => normalizeBaseName(alias))
+                .filter(alias => alias && alias.length >= 2);
+            if (!rawText || candidates.length === 0) return false;
 
-            const loweredName = normalizedName.toLowerCase();
             const tokenSet = new Set(
                 TokenizerEngine.tokenize(rawText)
                     .map(token => String(token || '').toLowerCase())
                     .filter(Boolean)
             );
-            if (tokenSet.has(loweredName)) return true;
-
             const compactText = rawText.toLowerCase().replace(/\s+/g, '');
-            const compactName = loweredName.replace(/\s+/g, '');
-            if (compactName.length >= 2 && compactText.includes(compactName)) {
-                if (buildEntityMentionRegex(normalizedName).test(rawText)) return true;
+
+            for (const candidate of candidates) {
+                const loweredName = candidate.toLowerCase();
+                if (tokenSet.has(loweredName)) return true;
+                const compactName = loweredName.replace(/\s+/g, '');
+                if (compactName.length >= 2 && compactText.includes(compactName)) {
+                    if (buildEntityMentionRegex(candidate).test(rawText)) return true;
+                }
+                if (buildEntityMentionRegex(candidate).test(rawText)) return true;
             }
 
-            return buildEntityMentionRegex(normalizedName).test(rawText);
+            return false;
+        };
+
+        const normalizeEntityShape = (entity) => {
+            if (!entity || typeof entity !== 'object') return entity;
+            entity.appearance = entity.appearance || {};
+            entity.appearance.features = Array.isArray(entity.appearance.features) ? entity.appearance.features : [];
+            entity.appearance.distinctiveMarks = Array.isArray(entity.appearance.distinctiveMarks) ? entity.appearance.distinctiveMarks : [];
+            entity.appearance.clothing = Array.isArray(entity.appearance.clothing) ? entity.appearance.clothing : [];
+            entity.personality = entity.personality || {};
+            entity.personality.traits = Array.isArray(entity.personality.traits) ? entity.personality.traits : [];
+            entity.personality.values = Array.isArray(entity.personality.values) ? entity.personality.values : [];
+            entity.personality.fears = Array.isArray(entity.personality.fears) ? entity.personality.fears : [];
+            entity.personality.likes = Array.isArray(entity.personality.likes) ? entity.personality.likes : [];
+            entity.personality.dislikes = Array.isArray(entity.personality.dislikes) ? entity.personality.dislikes : [];
+            entity.personality.sexualPreferences = Array.isArray(entity.personality.sexualPreferences) ? entity.personality.sexualPreferences : [];
+            entity.personality.sexualOrientation = typeof entity.personality.sexualOrientation === 'string' ? entity.personality.sexualOrientation : '';
+            entity.background = entity.background || {};
+            entity.background.origin = typeof entity.background.origin === 'string' ? entity.background.origin : '';
+            entity.background.occupation = typeof entity.background.occupation === 'string' ? entity.background.occupation : '';
+            entity.background.history = Array.isArray(entity.background.history) ? entity.background.history : [];
+            entity.background.secrets = Array.isArray(entity.background.secrets) ? entity.background.secrets : [];
+            entity.status = entity.status || {};
+            entity.status.currentLocation = typeof entity.status.currentLocation === 'string' ? entity.status.currentLocation : '';
+            entity.status.currentMood = typeof entity.status.currentMood === 'string' ? entity.status.currentMood : '';
+            entity.status.healthStatus = typeof entity.status.healthStatus === 'string' ? entity.status.healthStatus : '';
+            entity.status.lastUpdated = Number.isFinite(Number(entity.status.lastUpdated)) ? Number(entity.status.lastUpdated) : 0;
+            return entity;
         };
 
         const getOrCreateEntity = (name, lorebook) => {
-            const normalizedName = normalizeName(name);
+            const normalizedName = resolveCanonicalName(name, lorebook);
             if (!normalizedName) return null;
 
             if (entityCache.has(normalizedName)) return entityCache.get(normalizedName);
@@ -2432,16 +4732,20 @@
                 if (e.comment !== ENTITY_COMMENT) return false;
                 try {
                     const parsed = JSON.parse(e.content || '{}');
-                    return normalizeName(parsed.name || '') === normalizedName;
+                    return resolveCanonicalName(parsed.name || '', lorebook) === normalizedName;
                 } catch {
                     return false;
                 }
             });
             if (existing) {
                 try {
-                    const profile = JSON.parse(existing.content);
+                    const profile = normalizeEntityShape(JSON.parse(existing.content));
                     profile.meta = profile.meta || { created: 0, updated: 0, confidence: 0.5, source: '' };
                     if (!Array.isArray(profile.meta.m_ids) && profile.meta.m_id) profile.meta.m_ids = [profile.meta.m_id];
+                    profile.meta.aliases = Array.isArray(profile.meta.aliases) ? profile.meta.aliases : [];
+                    if (name && normalizeBaseName(name) && !profile.meta.aliases.includes(normalizeBaseName(name)) && normalizeBaseName(name) !== normalizedName) {
+                        profile.meta.aliases.push(normalizeBaseName(name));
+                    }
                     entityCache.set(normalizedName, profile);
                     return profile;
                 } catch {}
@@ -2452,10 +4756,10 @@
                 name: normalizedName,
                 type: 'character',
                 appearance: { features: [], distinctiveMarks: [], clothing: [] },
-                personality: { traits: [], values: [], fears: [], likes: [], dislikes: [] },
+                personality: { traits: [], values: [], fears: [], likes: [], dislikes: [], sexualOrientation: '', sexualPreferences: [] },
                 background: { origin: '', occupation: '', history: [], secrets: [] },
                 status: { currentLocation: '', currentMood: '', healthStatus: '', lastUpdated: 0 },
-                meta: { created: MemoryState.currentTurn, updated: 0, confidence: 0.5, source: '' }
+                meta: { created: MemoryState.currentTurn, updated: 0, confidence: 0.5, source: '', aliases: Array.from(new Set([normalizeBaseName(name)].filter(Boolean))) }
             };
 
             entityCache.set(normalizedName, newEntity);
@@ -2463,18 +4767,18 @@
         };
 
         const getOrCreateRelation = (nameA, nameB, lorebook) => {
-            const normalizedA = normalizeName(nameA);
-            const normalizedB = normalizeName(nameB);
+            const normalizedA = resolveCanonicalName(nameA, lorebook);
+            const normalizedB = resolveCanonicalName(nameB, lorebook);
             if (!normalizedA || !normalizedB || normalizedA === normalizedB) return null;
 
-            const relationId = makeRelationId(normalizedA, normalizedB);
+            const relationId = makeRelationId(normalizedA, normalizedB, lorebook);
             if (relationCache.has(relationId)) return relationCache.get(relationId);
 
             const existing = lorebook.find(e => {
                 if (e.comment !== RELATION_COMMENT) return false;
                 try {
                     const parsed = JSON.parse(e.content || '{}');
-                    const parsedId = parsed.id || makeRelationId(parsed.entityA || '', parsed.entityB || '');
+                    const parsedId = parsed.id || makeRelationId(parsed.entityA || '', parsed.entityB || '', lorebook);
                     return parsedId === relationId;
                 } catch {
                     return false;
@@ -2507,9 +4811,15 @@
         const updateEntity = (name, updates, lorebook) => {
             const entity = getOrCreateEntity(name, lorebook);
             if (!entity) return null;
+            entity.meta = entity.meta || { created: MemoryState.currentTurn, updated: 0, confidence: 0.5, source: '', aliases: [] };
+            entity.meta.aliases = Array.isArray(entity.meta.aliases) ? entity.meta.aliases : [];
+            const incomingAlias = normalizeBaseName(name);
+            if (incomingAlias && incomingAlias !== entity.name && !entity.meta.aliases.includes(incomingAlias)) {
+                entity.meta.aliases.push(incomingAlias);
+            }
 
             const currentTurn = MemoryState.currentTurn;
-            if (updates.m_id) {
+            if (updates.m_id != null) {
                 captureRollbackSnapshot(entity, updates.m_id, (target) => ({
                     appearance: target.appearance,
                     personality: target.personality,
@@ -2529,12 +4839,15 @@
             }
 
             if (updates.personality) {
-                for (const key of ['traits', 'values', 'fears', 'likes', 'dislikes']) {
+                for (const key of ['traits', 'values', 'fears', 'likes', 'dislikes', 'sexualPreferences']) {
                     if (Array.isArray(updates.personality[key])) {
                         if (!Array.isArray(entity.personality[key])) entity.personality[key] = [];
                         const newItems = updates.personality[key].filter(item => !entity.personality[key].includes(item));
                         entity.personality[key].push(...newItems);
                     }
+                }
+                if (updates.personality.sexualOrientation && !entity.personality.sexualOrientation) {
+                    entity.personality.sexualOrientation = updates.personality.sexualOrientation;
                 }
             }
 
@@ -2560,8 +4873,8 @@
             entity.meta.confidence = Math.min(1, entity.meta.confidence + 0.1);
             
             // Sync/Rollback Metadata
-            if (updates.s_id) entity.meta.s_id = updates.s_id;
-            if (updates.m_id) addSourceMessageId(entity.meta, updates.m_id);
+            if (updates.s_id != null) entity.meta.s_id = updates.s_id;
+            if (updates.m_id != null) addSourceMessageId(entity.meta, updates.m_id);
 
             return entity;
         };
@@ -2571,7 +4884,7 @@
             if (!relation) return null;
 
             const currentTurn = MemoryState.currentTurn;
-            if (updates.m_id) {
+            if (updates.m_id != null) {
                 captureRollbackSnapshot(relation, updates.m_id, (target) => ({
                     relationType: target.relationType,
                     details: target.details,
@@ -2603,22 +4916,22 @@
             relation.sentiments.lastInteraction = currentTurn;
 
             // Sync/Rollback Metadata
-            if (updates.s_id) relation.meta.s_id = updates.s_id;
-            if (updates.m_id) addSourceMessageId(relation.meta, updates.m_id);
+            if (updates.s_id != null) relation.meta.s_id = updates.s_id;
+            if (updates.m_id != null) addSourceMessageId(relation.meta, updates.m_id);
 
             harmonizeRelationMetrics(relation);
 
             return relation;
         };
 
-        const checkConsistency = (entityName, newInfo) => {
-            const entity = entityCache.get(normalizeName(entityName));
+        const checkConsistency = (entityName, newInfo, lorebook = []) => {
+            const entity = entityCache.get(resolveCanonicalName(entityName, lorebook));
             if (!entity) return { consistent: true, conflicts: [] };
 
             const conflicts = [];
             if (newInfo.appearance?.features) {
                 const opposites = { '키가 큼': ['키가 작음'], '키가 작음': ['키가 큼'], '검은 머리': ['금발', '갈색 머리'], '금발': ['검은 머리', '갈색 머리'], 'tall': ['short'], 'short': ['tall'], 'black hair': ['blonde', 'brown hair'], 'blonde': ['black hair', 'brown hair'], 'brown hair': ['black hair', 'blonde'] };
-                const currentFeatures = entity.appearance.features.join(' ');
+                const currentFeatures = Array.isArray(entity.appearance.features) ? entity.appearance.features : [];
                 for (const feature of newInfo.appearance.features) {
                     if (opposites[feature]) {
                         for (const opp of opposites[feature]) {
@@ -2640,6 +4953,8 @@
                 parts.push(`  외모/Appearance: ${[...entity.appearance.features, ...entity.appearance.distinctiveMarks].join(', ')}`);
             }
             if (entity.personality.traits.length > 0) parts.push(`  성격/Personality: ${entity.personality.traits.join(', ')}`);
+            if (entity.personality.sexualOrientation) parts.push(`  성관념/Sexual Orientation: ${entity.personality.sexualOrientation}`);
+            if (entity.personality.sexualPreferences?.length > 0) parts.push(`  성적취향/Sexual Preferences: ${entity.personality.sexualPreferences.join(', ')}`);
             if (entity.personality.likes.length > 0) parts.push(`  좋아하는 것/Likes: ${entity.personality.likes.join(', ')}`);
             if (entity.personality.dislikes.length > 0) parts.push(`  싫어하는 것/Dislikes: ${entity.personality.dislikes.join(', ')}`);
             if (entity.background.origin) parts.push(`  출신/Origin: ${entity.background.origin}`);
@@ -2671,19 +4986,35 @@
             for (const entry of lorebook) {
                 try {
                     if (entry.comment === ENTITY_COMMENT) {
-                        const entity = JSON.parse(entry.content);
+                        const entity = normalizeEntityShape(JSON.parse(entry.content));
                         entity.id = entity.id || TokenizerEngine.simpleHash(normalizeName(entity.name || ''));
                         entity.meta = entity.meta || { created: 0, updated: 0, confidence: 0.5, source: '' };
                         if (!Array.isArray(entity.meta.m_ids) && entity.meta.m_id) entity.meta.m_ids = [entity.meta.m_id];
-                        entityCache.set(normalizeName(entity.name), entity);
+                        entity.meta.aliases = Array.isArray(entity.meta.aliases) ? entity.meta.aliases : [];
+                        const canonicalName = resolveCanonicalName(entity.name, lorebook);
+                        if (entityCache.has(canonicalName)) {
+                            entityCache.set(canonicalName, mergeEntityRecords(entityCache.get(canonicalName), entity));
+                        } else {
+                            entityCache.set(canonicalName, entity);
+                        }
                     } else if (entry.comment === RELATION_COMMENT) {
                         const relation = JSON.parse(entry.content);
-                        relation.id = relation.id || makeRelationId(relation.entityA || '', relation.entityB || '');
+                        relation.entityA = resolveCanonicalName(relation.entityA || '', lorebook);
+                        relation.entityB = resolveCanonicalName(relation.entityB || '', lorebook);
+                        relation.id = relation.id || makeRelationId(relation.entityA || '', relation.entityB || '', lorebook);
                         relation.meta = relation.meta || { created: 0, updated: 0, confidence: 0.3, source: '' };
                         if (!Array.isArray(relation.meta.m_ids) && relation.meta.m_id) relation.meta.m_ids = [relation.meta.m_id];
-                        relationCache.set(relation.id, relation);
+                        if (relationCache.has(relation.id)) {
+                            relationCache.set(relation.id, mergeRelationRecords(relationCache.get(relation.id), relation));
+                        } else {
+                            relationCache.set(relation.id, relation);
+                        }
                     }
-                } catch {}
+                } catch (e) {
+                    if (typeof MemoryEngine !== 'undefined' && MemoryEngine.CONFIG?.debug) {
+                        console.warn('[LIBRA] rebuildCache entry parse error:', e?.message);
+                    }
+                }
             }
         };
 
@@ -2705,7 +5036,7 @@
                     if (e.comment !== ENTITY_COMMENT) return false;
                     try {
                         const parsed = JSON.parse(e.content || '{}');
-                        return normalizeName(parsed.name || '') === name;
+                        return resolveCanonicalName(parsed.name || '', lorebook) === name;
                     } catch {
                         return false;
                     }
@@ -2729,7 +5060,7 @@
                     if (e.comment !== RELATION_COMMENT) return false;
                     try {
                         const parsed = JSON.parse(e.content || '{}');
-                        const parsedId = parsed.id || makeRelationId(parsed.entityA || '', parsed.entityB || '');
+                        const parsedId = parsed.id || makeRelationId(parsed.entityA || '', parsed.entityB || '', lorebook);
                         return parsedId === id;
                     } catch {
                         return false;
@@ -2741,6 +5072,7 @@
         };
 
         return {
+            refreshIdentity,
             normalizeName, makeRelationId, getOrCreateEntity, getOrCreateRelation,
             updateEntity, updateRelation, checkConsistency, formatEntityForPrompt,
             formatRelationForPrompt, clearCache, rebuildCache, saveToLorebook,
@@ -2762,11 +5094,212 @@
             lastSummaryTurn: 0
         };
 
+        const clipText = (text, max = 180) => {
+            const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+            if (!normalized) return '';
+            if (normalized.length <= max) return normalized;
+            const sliced = normalized.slice(0, Math.max(0, max - 1));
+            const boundary = Math.max(sliced.lastIndexOf('. '), sliced.lastIndexOf('! '), sliced.lastIndexOf('? '), sliced.lastIndexOf(', '), sliced.lastIndexOf(' '));
+            const compact = (boundary >= Math.max(24, Math.floor(max * 0.45)) ? sliced.slice(0, boundary) : sliced).trim();
+            return `${compact}…`;
+        };
+
+        const cleanNarrativeText = (text) => {
+            const raw = Utils.getNarrativeSourceText(text, 'ai') || Utils.getMemorySourceText(text);
+            if (!raw) return '';
+            const cleanedLines = raw
+                .replace(/\r/g, '')
+                .split('\n')
+                .map(line => line.trim())
+                .filter(line => {
+                    if (!line) return false;
+                    if (/^#{1,6}\s+/.test(line)) return false;
+                    if (/^(?:volume|chapter)\b/i.test(line)) return false;
+                    if (/^chatindex\s*:/i.test(line)) return false;
+                    if (/^⏱️?\s*\[/.test(line)) return false;
+                    if (/^\[\s*(?:response|응답|assistant|character)\s*\]$/i.test(line)) return false;
+                    if (/^[-=_*]{3,}$/.test(line)) return false;
+                    if (/^```/.test(line)) return false;
+                    return true;
+                });
+            return cleanedLines.join('\n').trim();
+        };
+
+        const extractNarrativeParagraph = (text) => {
+            const cleaned = cleanNarrativeText(text);
+            if (!cleaned) return '';
+            const paragraphs = cleaned
+                .split(/\n{2,}/)
+                .map(part => part.replace(/\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim())
+                .filter(Boolean);
+            const meaningful = paragraphs.find(part => (part.match(/[A-Za-z0-9\u3131-\u318E\uAC00-\uD7A3\u3040-\u30FF\u4E00-\u9FFF]/g) || []).length >= 12);
+            return meaningful || paragraphs[0] || '';
+        };
+
+        const buildHeuristicTurnBrief = (userMsg, aiResponse) => {
+            const paragraph = extractNarrativeParagraph(aiResponse);
+            const normalizedUser = clipText(userMsg, 120);
+            if (!paragraph) return normalizedUser;
+
+            const sentences = paragraph.match(/[^.!?…\n]+(?:[.!?…]+|$)/g) || [paragraph];
+            const picked = [];
+            let totalLength = 0;
+            for (const sentence of sentences) {
+                const compact = sentence.replace(/\s+/g, ' ').trim();
+                if (!compact) continue;
+                if (picked.length >= 2) break;
+                if (picked.length > 0 && totalLength + compact.length > 180) break;
+                picked.push(compact);
+                totalLength += compact.length;
+            }
+
+            const summary = clipText((picked.join(' ') || paragraph).replace(/^["'“”‘’]+|["'“”‘’]+$/g, ''), 180);
+            if (summary) return summary;
+            return normalizedUser;
+        };
+
+        const generateTurnBrief = async (userMsg, aiResponse, config) => {
+            const heuristic = buildHeuristicTurnBrief(userMsg, aiResponse);
+            if (!LLMProvider.isConfigured(config, 'aux')) return heuristic;
+
+            const sourceUser = clipText(userMsg, 180);
+            const sourceAi = clipText(extractNarrativeParagraph(aiResponse), 900);
+            if (!sourceAi) return heuristic;
+
+            try {
+                const result = await runMaintenanceLLM(() =>
+                    LLMProvider.call(
+                        config,
+                        'You compress a roleplay turn into one concrete narrative beat. Focus on what changed, was decided, revealed, or emotionally shifted. Respond in the same language as the content. Output plain text only, one sentence, no markdown, no quotes, max 160 characters.',
+                        `User action:\n${sourceUser || '(none)'}\n\nAI response:\n${sourceAi}`,
+                        { maxTokens: 120, profile: 'aux' }
+                    )
+                , 'narrative-turn-brief');
+                return clipText(result?.content || heuristic, 180) || heuristic;
+            } catch (e) {
+                console.warn('[LIBRA] Narrative turn brief failed:', e?.message);
+                return heuristic;
+            }
+        };
+
+        const deriveKeyPointsFromBrief = (brief, maxItems = 3) => {
+            const normalized = String(brief || '').replace(/\s+/g, ' ').trim();
+            if (!normalized) return [];
+            const parts = normalized
+                .split(/\s*(?:;|,| 그리고 | but | however | meanwhile | while )\s*/i)
+                .map(part => clipText(part, 80))
+                .filter(Boolean);
+            return [...new Set(parts)].slice(0, maxItems);
+        };
+
+        const deriveOngoingTensionsFromTurn = (turnEntry, maxItems = 3) => {
+            const brief = clipText(turnEntry?.summary || turnEntry?.response || '', 180);
+            const userAction = clipText(turnEntry?.userAction || '', 120);
+            const candidates = [];
+            if (brief) candidates.push(`Current pressure: ${brief}`);
+            if (userAction && brief && !brief.toLowerCase().includes(userAction.toLowerCase())) {
+                candidates.push(`Pending response to: ${userAction}`);
+            }
+            if (!brief && userAction) candidates.push(`Pending response to: ${userAction}`);
+            return [...new Set(candidates.map(item => clipText(item, 120)).filter(Boolean))].slice(0, maxItems);
+        };
+
+        const applyLiveNarrativeSnapshot = (storyline, turnEntry) => {
+            if (!storyline || !turnEntry) return;
+            const brief = clipText(turnEntry.summary || turnEntry.response || turnEntry.userAction, 180);
+            if (!brief) return;
+
+            storyline.currentContext = brief;
+            const liveKeyPoints = deriveKeyPointsFromBrief(brief);
+            const liveTensions = deriveOngoingTensionsFromTurn(turnEntry);
+            if ((!Array.isArray(storyline.keyPoints) || storyline.keyPoints.length === 0) && liveKeyPoints.length > 0) {
+                storyline.keyPoints = liveKeyPoints;
+            }
+            if (!Array.isArray(storyline.ongoingTensions) || storyline.ongoingTensions.length === 0) {
+                storyline.ongoingTensions = liveTensions;
+            } else if (liveTensions.length > 0) {
+                storyline.ongoingTensions = [...new Set([...liveTensions, ...storyline.ongoingTensions])].slice(0, 6);
+            }
+            storyline.summaries = Array.isArray(storyline.summaries) ? storyline.summaries : [];
+
+            const existingLiveIndex = storyline.summaries.findIndex(entry => entry?.live === true);
+            const liveEntry = {
+                upToTurn: Number(turnEntry.turn || 0),
+                summary: brief,
+                keyPoints: liveKeyPoints,
+                ongoingTensions: [...storyline.ongoingTensions],
+                timestamp: Date.now(),
+                live: true
+            };
+
+            if (existingLiveIndex >= 0) storyline.summaries[existingLiveIndex] = liveEntry;
+            else storyline.summaries.push(liveEntry);
+
+            if (storyline.summaries.length > 12) {
+                storyline.summaries = storyline.summaries.slice(-12);
+            }
+        };
+
+        const normalizeTurnEntry = (entry = {}) => {
+            const userAction = clipText(entry.userAction || '', 200);
+            const sourceResponse = String(entry.summary || entry.response || '').trim();
+            const summary = clipText(buildHeuristicTurnBrief(userAction, sourceResponse), 180);
+            return {
+                turn: Number(entry.turn || 0),
+                timestamp: Number(entry.timestamp || Date.now()),
+                userAction,
+                response: summary,
+                involvedEntities: Array.isArray(entry.involvedEntities)
+                    ? entry.involvedEntities.map(e => typeof e === 'string' ? e : e?.name).filter(Boolean)
+                    : [],
+                summary
+            };
+        };
+
+        const normalizeState = (state = null) => {
+            const nextState = state && typeof state === 'object' ? safeClone(state) : { storylines: [], turnLog: [], lastSummaryTurn: 0 };
+            nextState.turnLog = Array.isArray(nextState.turnLog) ? nextState.turnLog.map(normalizeTurnEntry).filter(entry => entry.turn >= 0) : [];
+            const turnMap = new Map(nextState.turnLog.map(entry => [entry.turn, entry]));
+            nextState.storylines = Array.isArray(nextState.storylines) ? nextState.storylines.map((storyline, idx) => {
+                const turns = Array.isArray(storyline?.turns) ? storyline.turns.map(turn => Number(turn)).filter(Number.isFinite) : [];
+                const recentEvents = Array.isArray(storyline?.recentEvents) ? storyline.recentEvents.map((event) => {
+                    const turn = Number(event?.turn ?? event);
+                    const matched = turnMap.get(turn);
+                    return {
+                        turn: Number.isFinite(turn) ? turn : '?',
+                        brief: clipText(matched?.summary || event?.brief || '', 180)
+                    };
+                }).filter(event => String(event.brief || '').trim()) : [];
+                return {
+                    id: Number(storyline?.id || idx + 1),
+                    name: String(storyline?.name || `Storyline #${idx + 1}`),
+                    entities: Array.isArray(storyline?.entities) ? storyline.entities.map(String).filter(Boolean) : [],
+                    turns,
+                    firstTurn: Number(storyline?.firstTurn || turns[0] || 0),
+                    lastTurn: Number(storyline?.lastTurn || turns[turns.length - 1] || 0),
+                    recentEvents: recentEvents.slice(-10),
+                    summaries: Array.isArray(storyline?.summaries) ? storyline.summaries.map(entry => ({
+                        upToTurn: Number(entry?.upToTurn || 0),
+                        summary: clipText(entry?.summary || '', 240),
+                        keyPoints: Array.isArray(entry?.keyPoints) ? entry.keyPoints.map(String).filter(Boolean) : [],
+                        ongoingTensions: Array.isArray(entry?.ongoingTensions) ? entry.ongoingTensions.map(String).filter(Boolean) : [],
+                        timestamp: Number(entry?.timestamp || Date.now()),
+                        live: entry?.live === true
+                    })) : [],
+                    currentContext: clipText(storyline?.currentContext || '', 260),
+                    keyPoints: Array.isArray(storyline?.keyPoints) ? storyline.keyPoints.map(String).filter(Boolean) : [],
+                    ongoingTensions: Array.isArray(storyline?.ongoingTensions) ? storyline.ongoingTensions.map(String).filter(Boolean) : []
+                };
+            }) : [];
+            nextState.lastSummaryTurn = Number(nextState.lastSummaryTurn || 0);
+            return nextState;
+        };
+
         const loadState = (lorebook) => {
             const entry = lorebook.find(e => e.comment === NARRATIVE_COMMENT);
             if (entry) {
                 try {
-                    narrativeState = JSON.parse(entry.content);
+                    narrativeState = normalizeState(JSON.parse(entry.content));
                 } catch (e) { console.warn('[LIBRA] Narrative state parse failed:', e?.message); }
             }
             return narrativeState;
@@ -2786,14 +5319,15 @@
             else lorebook.push(entry);
         };
 
-        const recordTurn = (turn, userMsg, aiResponse, entities = []) => {
+        const recordTurn = async (turn, userMsg, aiResponse, entities = [], config = MemoryEngine.CONFIG) => {
+            const responseBrief = await generateTurnBrief(userMsg, aiResponse, config);
             const turnEntry = {
                 turn,
                 timestamp: Date.now(),
-                userAction: userMsg.slice(0, 200),
-                response: aiResponse.slice(0, 300),
+                userAction: clipText(userMsg, 200),
+                response: responseBrief,
                 involvedEntities: entities.map(e => typeof e === 'string' ? e : e.name),
-                summary: ''
+                summary: responseBrief
             };
             narrativeState.turnLog.push(turnEntry);
 
@@ -2827,14 +5361,15 @@
                 }
                 bestMatch.recentEvents.push({
                     turn: turnEntry.turn,
-                    brief: turnEntry.userAction.slice(0, 80)
+                    brief: clipText(turnEntry.summary || turnEntry.response || turnEntry.userAction, 180)
                 });
                 if (bestMatch.recentEvents.length > 10) {
                     bestMatch.recentEvents = bestMatch.recentEvents.slice(-10);
                 }
+                applyLiveNarrativeSnapshot(bestMatch, turnEntry);
             } else if (entities.length > 0) {
                 const id = narrativeState.storylines.length + 1;
-                narrativeState.storylines.push({
+                const storyline = {
                     id,
                     name: `Storyline #${id}`,
                     entities: [...entities],
@@ -2843,12 +5378,15 @@
                     lastTurn: turnEntry.turn,
                     recentEvents: [{
                         turn: turnEntry.turn,
-                        brief: turnEntry.userAction.slice(0, 80)
+                        brief: clipText(turnEntry.summary || turnEntry.response || turnEntry.userAction, 180)
                     }],
                     summaries: [],
                     currentContext: '',
-                    keyPoints: []
-                });
+                    keyPoints: [],
+                    ongoingTensions: []
+                };
+                applyLiveNarrativeSnapshot(storyline, turnEntry);
+                narrativeState.storylines.push(storyline);
             }
         };
 
@@ -2865,28 +5403,33 @@
 
                 if (recentTurns.length < 3) continue;
 
-                if (config.useLLM && config.llm?.key) {
-                    const turnTexts = recentTurns.map(t => `Turn ${t.turn}: ${t.userAction} → ${t.response}`).join('\n');
+                if (LLMProvider.isConfigured(config, 'aux')) {
+                    const turnTexts = recentTurns.map(t => `Turn ${t.turn}: ${t.userAction} -> ${t.summary || t.response || t.userAction}`).join('\n');
                     tasks.push(
                         runMaintenanceLLM(() =>
                             LLMProvider.call(config,
                                 'You are a narrative analyst. Summarize the following story events concisely. Identify the key plot points, character developments, and ongoing tensions. Respond in the same language as the content.\n\nOutput JSON: {"summary": "...", "keyPoints": ["..."], "ongoingTensions": ["..."], "context": "brief context for continuation"}',
                                 `Storyline: ${storyline.name}\nEntities: ${storyline.entities.join(', ')}\n\nRecent events:\n${turnTexts}`,
-                                { maxTokens: 500 }
+                                { maxTokens: 500, profile: 'aux' }
                             )
                         , `narrative-summary-${storyline.id || storyline.name || 'storyline'}`).then(result => {
                             if (!result.content) return false;
                             const parsed = extractJson(result.content);
                             if (parsed) {
+                                storyline.summaries = (storyline.summaries || []).filter(entry => entry?.live !== true);
                                 storyline.summaries.push({
                                     upToTurn: currentTurn,
                                     summary: parsed.summary || '',
                                     keyPoints: parsed.keyPoints || [],
+                                    ongoingTensions: parsed.ongoingTensions || [],
                                     timestamp: Date.now()
                                 });
                                 storyline.currentContext = parsed.context || parsed.summary || '';
                                 if (parsed.keyPoints) {
                                     storyline.keyPoints = [...new Set([...storyline.keyPoints, ...parsed.keyPoints])].slice(-20);
+                                }
+                                if (parsed.ongoingTensions) {
+                                    storyline.ongoingTensions = [...new Set([...(storyline.ongoingTensions || []), ...parsed.ongoingTensions])].slice(-20);
                                 }
                                 return true;
                             }
@@ -2897,11 +5440,13 @@
                         })
                     );
                 } else {
-                    const brief = recentTurns.map(t => t.userAction.slice(0, 50)).join(' → ');
+                    const brief = clipText(recentTurns.map(t => t.summary || t.response || t.userAction).filter(Boolean).join(' -> '), 240);
+                    storyline.summaries = (storyline.summaries || []).filter(entry => entry?.live !== true);
                     storyline.summaries.push({
                         upToTurn: currentTurn,
                         summary: brief,
                         keyPoints: [],
+                        ongoingTensions: [],
                         timestamp: Date.now()
                     });
                     storyline.currentContext = brief;
@@ -2932,6 +5477,9 @@
                 if (storyline.keyPoints.length > 0) {
                     parts.push(`  Key Points: ${storyline.keyPoints.slice(-5).join('; ')}`);
                 }
+                if (Array.isArray(storyline.ongoingTensions) && storyline.ongoingTensions.length > 0) {
+                    parts.push(`  Ongoing Story Flow: ${storyline.ongoingTensions.slice(-5).join('; ')}`);
+                }
                 if (storyline.recentEvents.length > 0) {
                     const last3 = storyline.recentEvents.slice(-3);
                     parts.push(`  Recent: ${last3.map(e => `T${e.turn}: ${e.brief}`).join(' → ')}`);
@@ -2942,8 +5490,12 @@
         };
 
         const getState = () => narrativeState;
+        const resetState = (nextState = null) => {
+            narrativeState = normalizeState(nextState);
+            return narrativeState;
+        };
 
-        return { loadState, saveState, recordTurn, summarizeIfNeeded, formatForPrompt, getState };
+        return { loadState, saveState, recordTurn, summarizeIfNeeded, formatForPrompt, getState, resetState };
     })();
 
     // ══════════════════════════════════════════════════════════════
@@ -3094,7 +5646,7 @@
             let nextPlan = null;
             const mode = String(config.storyAuthorMode || 'proactive').toLowerCase();
 
-            if (config.useLLM && config.llm?.key) {
+            if (LLMProvider.isConfigured(config, 'aux')) {
                 try {
                     const system = [
                         'You are LIBRA Story Author, a proactive story planner working inside the memory engine.',
@@ -3120,10 +5672,10 @@
                         payload.loreSnippets.length ? `Lorebook Hints:\n- ${payload.loreSnippets.join('\n- ')}` : ''
                     ].filter(Boolean).join('\n\n');
                     const result = await runMaintenanceLLM(
-                        () => LLMProvider.call(config, system, user, { maxTokens: 700 }),
+                        () => LLMProvider.call(config, system, user, { maxTokens: 700, profile: 'aux' }),
                         `story-author-${currentTurn}`
                     );
-                    const parsed = extractJson(result?.content || '');
+                    const parsed = parseLooseJson(result?.content || '');
                     if (parsed) nextPlan = parsed;
                 } catch (e) {
                     console.warn('[LIBRA] Story author planning failed:', e?.message);
@@ -3171,8 +5723,246 @@
         };
 
         const getState = () => authorState;
+        const resetState = () => {
+            authorState = {
+                currentArc: '',
+                narrativeGoal: '',
+                activeTensions: [],
+                nextBeats: [],
+                guardrails: [],
+                focusCharacters: [],
+                recentDecisions: [],
+                autoAdvanceOnEmptyInput: true,
+                lastPlanTurn: 0,
+                lastUpdated: 0
+            };
+            return authorState;
+        };
 
-        return { loadState, saveState, updatePlanIfNeeded, formatForPrompt, getState };
+        return { loadState, saveState, updatePlanIfNeeded, formatForPrompt, getState, resetState };
+    })();
+
+    // ══════════════════════════════════════════════════════════════
+    // [MANAGER] Director
+    // ══════════════════════════════════════════════════════════════
+    const Director = (() => {
+        const DIRECTOR_COMMENT = 'lmai_director';
+
+        let directorState = {
+            sceneMandate: '',
+            requiredOutcomes: [],
+            forbiddenMoves: [],
+            emphasis: [],
+            targetPacing: 'steady',
+            pressureLevel: 'strong',
+            focusCharacters: [],
+            lastTurn: 0,
+            lastUpdated: 0
+        };
+
+        const loadState = (lorebook) => {
+            const entry = lorebook.find(e => e.comment === DIRECTOR_COMMENT);
+            if (entry) {
+                try {
+                    directorState = { ...directorState, ...JSON.parse(entry.content) };
+                } catch (e) { console.warn('[LIBRA] Director state parse failed:', e?.message); }
+            }
+            return directorState;
+        };
+
+        const saveState = async (lorebook) => {
+            const entry = {
+                key: 'lmai_director::directive',
+                comment: DIRECTOR_COMMENT,
+                content: JSON.stringify(directorState),
+                mode: 'normal',
+                insertorder: 6,
+                alwaysActive: false
+            };
+            const idx = lorebook.findIndex(e => e.comment === DIRECTOR_COMMENT);
+            if (idx >= 0) lorebook[idx] = entry;
+            else lorebook.push(entry);
+        };
+
+        const buildPayload = (turn, userMsg, aiResponse, involvedEntities = [], effectiveLore = []) => {
+            const names = [...new Set((involvedEntities || []).map(e => typeof e === 'string' ? e : e?.name).filter(Boolean))];
+            const entityCache = Array.from(EntityManager.getEntityCache().values());
+            const focusedEntities = names.length > 0
+                ? entityCache.filter(entity => names.includes(entity.name))
+                : entityCache.slice(0, 4);
+            const recentTurns = (NarrativeTracker.getState()?.turnLog || []).slice(-8)
+                .map(t => `Turn ${t.turn}: ${t.userAction} -> ${t.response}`);
+            const memoryEntries = MemoryEngine.getManagedEntries(effectiveLore)
+                .map(entry => ({ entry, meta: MemoryEngine.getCachedMeta(entry) }))
+                .sort((a, b) => (b.meta.imp - a.meta.imp) || (b.meta.t - a.meta.t))
+                .slice(0, 6)
+                .map(({ entry }) => (entry.content || '').replace(MemoryEngine.META_PATTERN, '').trim().slice(0, 180));
+
+            return {
+                turn,
+                userMsg,
+                aiResponse,
+                isEmptyInput: !String(userMsg || '').trim(),
+                focusedEntities: focusedEntities.map(e => e.name),
+                worldPrompt: HierarchicalWorldManager.formatForPrompt(),
+                worldStatePrompt: WorldStateTracker.formatForPrompt(),
+                narrativePrompt: NarrativeTracker.formatForPrompt(),
+                storyAuthorPrompt: StoryAuthor.formatForPrompt(),
+                recentTurns,
+                memoryEntries
+            };
+        };
+
+        const buildHeuristicDirective = (payload, mode) => {
+            const focus = payload.focusedEntities.slice(0, 4);
+            const requiredOutcomes = [];
+            const forbiddenMoves = [
+                'Do not end the response in a static holding pattern.',
+                'Do not contradict established world rules, relationships, or known facts.'
+            ];
+            const emphasis = [
+                'Prioritize concrete action, consequence, or decision over exposition.',
+                'Make at least one visible shift in tension, information, or relationship state.'
+            ];
+
+            if (focus.length > 0) {
+                requiredOutcomes.push(`At least one of ${focus.join(', ')} must take a decisive action.`);
+            } else {
+                requiredOutcomes.push('Someone in the current scene must trigger a concrete change before the response ends.');
+            }
+            if (payload.worldStatePrompt) {
+                requiredOutcomes.push('Use the current world state as active pressure on the scene.');
+            }
+            if (payload.isEmptyInput) {
+                requiredOutcomes.push('Continue the scene without waiting for user input and force one meaningful beat.');
+            }
+
+            let targetPacing = 'steady';
+            let pressureLevel = 'standard';
+            let sceneMandate = 'Drive the scene forward with a clear, consequential beat.';
+            if (mode === 'light') {
+                targetPacing = 'measured';
+                pressureLevel = 'light';
+                sceneMandate = 'Gently steer the scene toward a meaningful next beat without overwhelming the current tone.';
+            } else if (mode === 'strong') {
+                targetPacing = 'brisk';
+                pressureLevel = 'strong';
+                sceneMandate = 'Actively force a meaningful turn in the scene and avoid passive continuation.';
+            } else if (mode === 'absolute') {
+                targetPacing = 'relentless';
+                pressureLevel = 'absolute';
+                sceneMandate = 'Override passivity. The response must create an unmistakable narrative change this turn.';
+                forbiddenMoves.push('Do not resolve the turn with pure atmosphere, repetition, or non-committal dialogue.');
+            }
+
+            return {
+                sceneMandate,
+                requiredOutcomes,
+                forbiddenMoves,
+                emphasis,
+                targetPacing,
+                pressureLevel,
+                focusCharacters: focus
+            };
+        };
+
+        const updateDirective = async (currentTurn, config, userMsg, aiResponse, involvedEntities = [], effectiveLore = []) => {
+            if (!config.directorEnabled) return;
+
+            const payload = buildPayload(currentTurn, userMsg, aiResponse, involvedEntities, effectiveLore);
+            const mode = String(config.directorMode || 'strong').toLowerCase();
+            let nextDirective = null;
+
+            if (LLMProvider.isConfigured(config, 'aux')) {
+                try {
+                    const system = [
+                        'You are LIBRA Director, the highest-priority scene supervisor inside the memory engine.',
+                        'You intervene every turn and produce firm scene-direction rules for the next response.',
+                        'Focus on directorial control: pacing, mandatory beats, forbidden moves, and pressure.',
+                        'Do not write prose. Do not summarize vaguely. Create forceful, actionable supervision.',
+                        'Respond only as JSON: {"sceneMandate":"","requiredOutcomes":[""],"forbiddenMoves":[""],"emphasis":[""],"targetPacing":"","pressureLevel":"","focusCharacters":[""]}'
+                    ].join('\n');
+                    const user = [
+                        `Mode: ${mode}`,
+                        `Turn: ${currentTurn}`,
+                        payload.userMsg ? `User Input:\n${payload.userMsg}` : 'User Input: (empty)',
+                        payload.aiResponse ? `Latest Response:\n${payload.aiResponse}` : '',
+                        payload.worldPrompt ? `World:\n${payload.worldPrompt}` : '',
+                        payload.worldStatePrompt ? `World State:\n${payload.worldStatePrompt}` : '',
+                        payload.narrativePrompt ? `Narrative:\n${payload.narrativePrompt}` : '',
+                        payload.storyAuthorPrompt ? `Story Author:\n${payload.storyAuthorPrompt}` : '',
+                        payload.recentTurns.length ? `Recent Turns:\n${payload.recentTurns.join('\n')}` : '',
+                        payload.memoryEntries.length ? `Important Memories:\n- ${payload.memoryEntries.join('\n- ')}` : '',
+                        payload.focusedEntities.length ? `Focus Characters:\n${payload.focusedEntities.join(', ')}` : ''
+                    ].filter(Boolean).join('\n\n');
+                    const result = await runMaintenanceLLM(
+                        () => LLMProvider.call(config, system, user, { maxTokens: 650, profile: 'aux' }),
+                        `director-${currentTurn}`
+                    );
+                    const parsed = parseLooseJson(result?.content || '');
+                    if (parsed) nextDirective = parsed;
+                } catch (e) {
+                    console.warn('[LIBRA] Director planning failed:', e?.message);
+                }
+            }
+
+            if (!nextDirective) nextDirective = buildHeuristicDirective(payload, mode);
+
+            directorState = {
+                ...directorState,
+                sceneMandate: String(nextDirective.sceneMandate || directorState.sceneMandate || '').trim(),
+                requiredOutcomes: Array.isArray(nextDirective.requiredOutcomes) ? nextDirective.requiredOutcomes.slice(0, 6) : (directorState.requiredOutcomes || []),
+                forbiddenMoves: Array.isArray(nextDirective.forbiddenMoves) ? nextDirective.forbiddenMoves.slice(0, 6) : (directorState.forbiddenMoves || []),
+                emphasis: Array.isArray(nextDirective.emphasis) ? nextDirective.emphasis.slice(0, 6) : (directorState.emphasis || []),
+                targetPacing: String(nextDirective.targetPacing || directorState.targetPacing || 'steady').trim(),
+                pressureLevel: String(nextDirective.pressureLevel || directorState.pressureLevel || mode).trim(),
+                focusCharacters: Array.isArray(nextDirective.focusCharacters) ? nextDirective.focusCharacters.slice(0, 6) : payload.focusedEntities,
+                lastTurn: currentTurn,
+                lastUpdated: Date.now()
+            };
+        };
+
+        const formatForPrompt = () => {
+            if (!MemoryEngine.CONFIG.directorEnabled) return '';
+            const mode = String(MemoryEngine.CONFIG.directorMode || 'strong').toLowerCase();
+            const parts = ['【감독 개입 / Director Supervision】'];
+            if (mode === 'light') {
+                parts.push('Apply light but persistent guidance to keep the scene moving.');
+            } else if (mode === 'absolute') {
+                parts.push('This is top-priority direction. The response must obey it and create a strong narrative turn now.');
+            } else if (mode === 'strong') {
+                parts.push('Apply strong directorial control and force a meaningful beat in this response.');
+            } else {
+                parts.push('Apply firm directorial guidance in this response.');
+            }
+            if (directorState.sceneMandate) parts.push(`Scene Mandate: ${directorState.sceneMandate}`);
+            if (directorState.focusCharacters?.length) parts.push(`Focus Characters: ${directorState.focusCharacters.join(', ')}`);
+            if (directorState.targetPacing) parts.push(`Target Pacing: ${directorState.targetPacing}`);
+            if (directorState.pressureLevel) parts.push(`Pressure Level: ${directorState.pressureLevel}`);
+            if (directorState.requiredOutcomes?.length) parts.push(`Required Outcomes: ${directorState.requiredOutcomes.join('; ')}`);
+            if (directorState.forbiddenMoves?.length) parts.push(`Forbidden Moves: ${directorState.forbiddenMoves.join('; ')}`);
+            if (directorState.emphasis?.length) parts.push(`Emphasis: ${directorState.emphasis.join('; ')}`);
+            parts.push('Treat these instructions as higher priority than passive continuation. The response must create visible movement in plot, tension, or relationship state this turn.');
+            return parts.join('\n');
+        };
+
+        const getState = () => directorState;
+        const resetState = () => {
+            directorState = {
+                sceneMandate: '',
+                requiredOutcomes: [],
+                forbiddenMoves: [],
+                emphasis: [],
+                targetPacing: 'steady',
+                pressureLevel: 'strong',
+                focusCharacters: [],
+                lastTurn: 0,
+                lastUpdated: 0
+            };
+            return directorState;
+        };
+
+        return { loadState, saveState, updateDirective, formatForPrompt, getState, resetState };
     })();
 
     // ══════════════════════════════════════════════════════════════
@@ -3246,7 +6036,7 @@
             );
             if (recentLogs.length < 3) return;
 
-            if (config.useLLM && config.llm?.key) {
+            if (LLMProvider.isConfigured(config, 'aux')) {
                 try {
                     const logText = recentLogs.map(l =>
                         `Turn ${l.turn}: Location=${l.location}, Mood=${l.mood}, Health=${l.health}${l.notes ? ', Notes=' + l.notes : ''}`
@@ -3256,7 +6046,7 @@
                         LLMProvider.call(config,
                             'Summarize the character state changes below. Note significant changes. Respond in the same language as the content.\nOutput JSON: {"summary": "...", "significantChanges": ["..."]}',
                             `Character: ${entityName}\nState log:\n${logText}`,
-                            { maxTokens: 300 }
+                            { maxTokens: 300, profile: 'aux' }
                         )
                     , `char-state-${entityName}`);
 
@@ -3330,8 +6120,12 @@
         };
 
         const getState = () => stateHistory;
+        const resetState = (nextState = null) => {
+            stateHistory = nextState ? safeClone(nextState) : {};
+            return stateHistory;
+        };
 
-        return { loadState, saveState, recordState, recordCriticalMoment, consolidateIfNeeded, isCriticalMoment, formatForPrompt, getState };
+        return { loadState, saveState, recordState, recordCriticalMoment, consolidateIfNeeded, isCriticalMoment, formatForPrompt, getState, resetState };
     })();
 
     // ══════════════════════════════════════════════════════════════
@@ -3393,7 +6187,7 @@
             const recentLogs = stateHistory.turnLog.filter(t => t.turn > stateHistory.lastConsolidationTurn);
             if (recentLogs.length < 3) return;
 
-            if (config.useLLM && config.llm?.key) {
+            if (LLMProvider.isConfigured(config, 'aux')) {
                 try {
                     const logText = recentLogs.map(l =>
                         `Turn ${l.turn}: World=${(l.activeWorld||[]).join('→')}, Notes=${l.notes||'none'}`
@@ -3403,7 +6197,7 @@
                         LLMProvider.call(config,
                             'Summarize world state changes below. Note dimension shifts and rule changes. Respond in the same language as the content.\nOutput JSON: {"summary": "...", "significantChanges": ["..."]}',
                             `World state log:\n${logText}`,
-                            { maxTokens: 300 }
+                            { maxTokens: 300, profile: 'aux' }
                         )
                     , `world-state-${currentTurn}`);
 
@@ -3464,8 +6258,12 @@
         };
 
         const getState = () => stateHistory;
+        const resetState = (nextState = null) => {
+            stateHistory = nextState ? safeClone(nextState) : { turnLog: [], consolidated: [], lastConsolidationTurn: 0 };
+            return stateHistory;
+        };
 
-        return { loadState, saveState, recordState, recordCriticalMoment, consolidateIfNeeded, isCriticalMoment, formatForPrompt, getState };
+        return { loadState, saveState, recordState, recordCriticalMoment, consolidateIfNeeded, isCriticalMoment, formatForPrompt, getState, resetState };
     })();
 
     // ══════════════════════════════════════════════════════════════
@@ -3489,10 +6287,11 @@
             emotionEnabled: true,
             storyAuthorEnabled: true,
             storyAuthorMode: 'proactive',
-            enableGigaTrans: false,
-            enableLightboard: false,
+            directorEnabled: true,
+            directorMode: 'strong',
             worldAdjustmentMode: 'dynamic',
             llm: { provider: 'openai', url: '', key: '', model: 'gpt-4o-mini', temp: 0.3, timeout: 120000, reasoningEffort: 'none', reasoningBudgetTokens: 0 },
+            auxLlm: { enabled: false, provider: 'openai', url: '', key: '', model: 'gpt-4o-mini', temp: 0.2, timeout: 90000, reasoningEffort: 'none', reasoningBudgetTokens: 0 },
             embed: { provider: 'openai', url: '', key: '', model: 'text-embedding-3-small', timeout: 120000 }
         };
 
@@ -3526,7 +6325,7 @@
 
             if (CONFIG.emotionEnabled) {
                 const emotion = EmotionEngine.analyze(text);
-                const mapping = { sadness: 'romance', anger: 'action', fear: 'mystery', joy: 'daily', surprise: 'mystery', disgust: 'mystery' };
+                const mapping = { affection: 'romance', sadness: 'romance', anger: 'action', fear: 'mystery', joy: 'daily', surprise: 'mystery', disgust: 'mystery' };
                 for (const [emotionName, emotionScore] of Object.entries(emotion.scores || {})) {
                     if (!emotionScore) continue;
                     const mappedGenre = mapping[emotionName];
@@ -3551,6 +6350,7 @@
         const calculateDynamicWeights = (query) => detectGenreWeights(query) || CONFIG.weights;
         const _log = (msg) => { if (CONFIG.debug) console.log(`[LIBRA] ${msg}`); };
         const getSafeKey = (entry) => entry.id || TokenizerEngine.getSafeMapKey(entry.content || "");
+        let lastRetrievalDebug = null;
 
         const META_PATTERN = /\[META:(\{[^}]+\})\]/;
         const parseMeta = (raw) => {
@@ -3575,7 +6375,7 @@
         const calcSimilarity = async (textA, textB) => {
             const hA = TokenizerEngine.simpleHash(textA);
             const hB = TokenizerEngine.simpleHash(textB);
-            const cKey = hA < hB ?`${hA}_${hB}` :`${hB}_${hA}`;
+            const cKey = hA < hB ? `${hA}_${hB}` : `${hB}_${hA}`;
             const simCache = getSimCache();
             if (simCache.has(cKey)) return simCache.get(cKey);
 
@@ -3590,9 +6390,15 @@
 
             if (jaccard < 0.1) { simCache.set(cKey, 0); return 0; }
 
-            const vecA = await EmbeddingEngine.getEmbedding(textA);
-            const vecB = await EmbeddingEngine.getEmbedding(textB);
-            const score = (vecA && vecB) ? EmbeddingEngine.cosineSimilarity(vecA, vecB) * 0.7 + jaccard * 0.3 : jaccard;
+            const engine = EmbeddingEngine;
+            if (!engine || typeof engine.getEmbedding !== 'function' || typeof engine.cosineSimilarity !== 'function') {
+                simCache.set(cKey, jaccard);
+                return jaccard;
+            }
+
+            const vecA = await engine.getEmbedding(textA);
+            const vecB = await engine.getEmbedding(textB);
+            const score = (vecA && vecB) ? engine.cosineSimilarity(vecA, vecB) * 0.7 + jaccard * 0.3 : jaccard;
             simCache.set(cKey, score);
             return score;
         };
@@ -3701,10 +6507,25 @@
         };
 
         const EmbeddingEngine = (() => {
+            const debugStats = {
+                totalCalls: 0,
+                cacheHits: 0,
+                providerCalls: 0,
+                lastProvider: '',
+                lastModel: '',
+                lastDims: 0,
+                lastStatus: 'idle'
+            };
             return {
                 getEmbedding: async (text) => {
+                    debugStats.totalCalls += 1;
                     const cache = getSimCache();
                     if (cache.has(text)) {
+                        debugStats.cacheHits += 1;
+                        debugStats.lastProvider = CONFIG.embed?.provider || 'openai';
+                        debugStats.lastModel = CONFIG.embed?.model || '';
+                        debugStats.lastDims = Array.isArray(cache.get(text)) ? cache.get(text).length : 0;
+                        debugStats.lastStatus = 'cache-hit';
                         if (CONFIG.debug) {
                             console.log(`[LIBRA][EMBED] cache-hit | provider=${CONFIG.embed?.provider || 'openai'} | model=${CONFIG.embed?.model || ''} | chars=${String(text || '').length}`);
                         }
@@ -3717,6 +6538,10 @@
                         try {
                             const providerName = m.provider || 'openai';
                             const provider = AutoProvider.get(providerName);
+                            debugStats.providerCalls += 1;
+                            debugStats.lastProvider = providerName;
+                            debugStats.lastModel = m.model || '';
+                            debugStats.lastStatus = 'start';
                             const startAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
                             if (CONFIG.debug) {
                                 console.log(
@@ -3726,6 +6551,8 @@
                             const vec = await provider.getEmbedding(CONFIG, text);
 
                             if (vec) cache.set(text, vec);
+                            debugStats.lastDims = Array.isArray(vec) ? vec.length : 0;
+                            debugStats.lastStatus = vec ? 'success' : 'empty';
                             if (CONFIG.debug) {
                                 const endAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
                                 console.log(
@@ -3734,11 +6561,13 @@
                             }
                             return vec;
                         } catch (e) {
+                            debugStats.lastStatus = 'error';
                             if (CONFIG.debug) console.warn('[LIBRA] Embedding Error:', e?.message || e);
                             return null;
                         }
                     });
                 },
+                getDebugSnapshot: () => ({ ...debugStats }),
                 cosineSimilarity: (a, b) => {
                     if (!a || !b || a.length !== b.length) return 0;
                     let dot = 0, normA = 0, normB = 0;
@@ -3753,7 +6582,8 @@
             return memories.map((m, i) => {
                 const meta = getCachedMeta(m);
                 const content = (m.content || "").replace(META_PATTERN, '').trim();
-                return`[${i + 1}] (중요도:${meta.imp}/10) ${meta.summary || content.slice(0, 100)}`;
+                const originLabel = meta.source === 'narrative_source_record' ? '서사 근거 원문' : '원문 기억';
+                return`[${i + 1}] (${originLabel} / 중요도:${meta.imp}/10) ${content.slice(0, 140)}`;
             }).join('\n');
         };
 
@@ -3768,7 +6598,11 @@
                     const idx = (MemoryState.gcCursor + i) % memoryEntries.length;
                     const entry = memoryEntries[idx];
                     const meta = getCachedMeta(entry);
-                    if (meta.ttl !== -1 && (meta.t + meta.ttl) < currentTurn) toDelete.add(getSafeKey(entry));
+                    const ttl = Number(meta.ttl);
+                    const turn = Number(meta.t);
+                    if (ttl !== -1 && Number.isFinite(turn) && Number.isFinite(ttl) && (turn + ttl) < currentTurn) {
+                        toDelete.add(getSafeKey(entry));
+                    }
                 }
                 MemoryState.gcCursor = (MemoryState.gcCursor + CONFIG.gcBatchSize) % Math.max(1, memoryEntries.length);
             }
@@ -3811,13 +6645,18 @@
                 entries.forEach(entry => {
                     if (entry.comment === 'lmai_memory') {
                         try {
-                            const content = (entry.content || "").replace(META_PATTERN, '').trim();
+                            const content = Utils.getMemorySourceText((entry.content || "").replace(META_PATTERN, ''));
                             if (content.length < 5) return;
+                            if (Utils.shouldExcludeStoredMemoryContent(content)) return;
                             const key = getSafeKey(entry);
                             const idxKey = TokenizerEngine.getIndexKey(content);
                             if (!MemoryState.hashIndex.has(idxKey)) MemoryState.hashIndex.set(idxKey, new Set());
                             MemoryState.hashIndex.get(idxKey).add(key);
-                        } catch {}
+                        } catch (e) {
+                            if (CONFIG.debug) {
+                                console.warn('[LIBRA] rebuildIndex entry error:', e?.message);
+                            }
+                        }
                     }
                 });
             },
@@ -3831,15 +6670,19 @@
 
                 for (const item of uniqueCheck) {
                     if (!item || !item.content) continue;
-                    if (Math.abs(item.content.length - content.length) > content.length * 0.7) continue;
-                    if (await calcSimilarity(item.content, content) > 0.75) return true;
+                    const existingContent = Utils.getMemorySourceText((item.content || "").replace(META_PATTERN, ''));
+                    if (!existingContent) continue;
+                    if (Math.abs(existingContent.length - content.length) > content.length * 0.7) continue;
+                    if (await calcSimilarity(existingContent, content) > 0.75) return true;
                 }
                 return false;
             },
 
             prepareMemory: async (data, currentTurn, existingList, lorebook, char, chat, m_id = null) => {
-                const { content, importance } = data;
+                const content = Utils.getMemorySourceText(data?.content || '');
+                const importance = data?.importance;
                 if (!content || content.length < 5) return null;
+                if (Utils.shouldExcludeStoredMemoryContent(content)) return null;
 
                 const managed = MemoryEngine.getManagedEntries(lorebook);
                 if (managed.length >= Math.floor(CONFIG.maxLimit * 0.95)) {
@@ -3861,7 +6704,9 @@
                 const ttl = imp >= Math.max(9, CONFIG.threshold + 2) ? -1 : (imp >= CONFIG.threshold ? 60 : 30);
                 const meta = { 
                     t: currentTurn, ttl, imp, cat: 'personal', ent: [], 
-                    summary: content.slice(0, 50),
+                    summary: '',
+                    source: 'narrative_source_record',
+                    sourceHint: 'Used as source evidence for narrative summaries.',
                     s_id: MemoryState.currentSessionId,
                     m_id: m_id
                 };
@@ -3882,22 +6727,109 @@
 
             retrieveMemories: async (query, currentTurn, candidates, vars, topK = 15) => {
                 const cleanQuery = query.trim();
+                const queryTokens = TokenizerEngine.tokenize(cleanQuery);
                 const W = calculateDynamicWeights(cleanQuery);
-                const validCandidates = candidates.filter(entry => {
+                const originalCandidateCount = Array.isArray(candidates) ? candidates.length : 0;
+                
+                let filtered = candidates.filter(entry => {
                     const meta = getCachedMeta(entry);
-                    return meta.ttl === -1 || (meta.t + meta.ttl) >= currentTurn;
+                    const ttl = Number(meta.ttl);
+                    const turn = Number(meta.t);
+                    if (!(ttl === -1 || (Number.isFinite(turn) && Number.isFinite(ttl) && (turn + ttl) >= currentTurn))) return false;
+                    const content = Utils.getMemorySourceText((entry.content || "").replace(META_PATTERN, ''));
+                    if (Utils.shouldExcludeStoredMemoryContent(content)) return false;
+                    return true;
                 });
 
-                const results = await Promise.all(validCandidates.map(async (entry) => {
+                // Optimization: Pre-filter by keyword overlap if too many candidates,
+                // but keep a recency/importance backstop so paraphrased RP recall
+                // queries do not lose their best semantic matches before similarity.
+                if (filtered.length > 50 && queryTokens.length >= 2) {
+                    const ranked = filtered.map(entry => {
+                        const content = Utils.getMemorySourceText((entry.content || "").replace(META_PATTERN, ''));
+                        const contentTokens = new Set(TokenizerEngine.tokenize(content));
+                        let overlap = 0;
+                        for (const token of queryTokens) {
+                            if (contentTokens.has(token)) overlap++;
+                        }
+                        const meta = getCachedMeta(entry);
+                        const fallbackRank = (calcRecency(meta.t, currentTurn) * 0.6) + ((meta.imp / 10) * 0.4);
+                        return { entry, overlap, fallbackRank };
+                    });
+
+                    const maxOverlap = ranked.reduce((max, item) => Math.max(max, item.overlap), 0);
+                    if (maxOverlap > 0) {
+                        const selected = new Set();
+                        const overlapTop = ranked
+                            .slice()
+                            .sort((a, b) => b.overlap - a.overlap || b.fallbackRank - a.fallbackRank)
+                            .slice(0, 60);
+                        overlapTop.forEach(item => selected.add(item.entry));
+
+                        const fallbackTop = ranked
+                            .slice()
+                            .sort((a, b) => b.fallbackRank - a.fallbackRank || b.overlap - a.overlap)
+                            .slice(0, 20);
+                        fallbackTop.forEach(item => selected.add(item.entry));
+
+                        filtered = Array.from(selected);
+                    }
+                }
+
+                let belowThresholdCount = 0;
+                const scoredResults = await Promise.all(filtered.map(async (entry) => {
                     const meta = getCachedMeta(entry);
-                    const text = (entry.content || "").replace(META_PATTERN, '').trim();
+                    const text = Utils.getMemorySourceText((entry.content || "").replace(META_PATTERN, ''));
                     const sim = await calcSimilarity(cleanQuery, text);
-                    if (sim < CONFIG.simThreshold) return null;
-                    const score = (sim * W.similarity) + (calcRecency(meta.t, currentTurn) * W.recency) + ((meta.imp / 10) * W.importance);
-                    return { ...entry, _score: score };
+                    const recency = calcRecency(meta.t, currentTurn);
+                    const importance = (meta.imp / 10);
+                    const score = (sim * W.similarity) + (recency * W.recency) + (importance * W.importance);
+                    if (sim < CONFIG.simThreshold) {
+                        belowThresholdCount += 1;
+                        return {
+                            entry,
+                            accepted: false,
+                            similarity: sim,
+                            recency,
+                            importance,
+                            finalScore: score,
+                            meta,
+                            text
+                        };
+                    }
+                    return {
+                        entry: { ...entry, _score: score },
+                        accepted: true,
+                        similarity: sim,
+                        recency,
+                        importance,
+                        finalScore: score,
+                        meta,
+                        text
+                    };
                 }));
 
-                return results.filter(Boolean).sort((a, b) => b._score - a._score).slice(0, topK);
+                const accepted = scoredResults.filter(item => item && item.accepted).sort((a, b) => b.finalScore - a.finalScore);
+                const selected = accepted.slice(0, topK).map(item => item.entry);
+                lastRetrievalDebug = {
+                    query: cleanQuery,
+                    originalCandidates: originalCandidateCount,
+                    filteredCandidates: filtered.length,
+                    selectedCount: selected.length,
+                    belowThresholdCount,
+                    simThreshold: CONFIG.simThreshold,
+                    threshold: CONFIG.threshold,
+                    weights: { ...W },
+                    topEntries: accepted.slice(0, Math.min(3, accepted.length)).map(item => ({
+                        importance: Number(item.importance.toFixed(3)),
+                        similarity: Number(item.similarity.toFixed(3)),
+                        recency: Number(item.recency.toFixed(3)),
+                        finalScore: Number(item.finalScore.toFixed(3)),
+                        turn: item.meta?.t || 0,
+                        preview: String(item.text || '').slice(0, 80)
+                    }))
+                };
+                return selected;
             },
 
             getLorebook: (char, chat) => Array.isArray(chat?.localLore) ? chat.localLore : (Array.isArray(char?.lorebook) ? char.lorebook : []),
@@ -3912,6 +6844,7 @@
                 else if (char) char.lorebook = data;
             },
             getManagedEntries: (lorebook) => (Array.isArray(lorebook) ? lorebook : []).filter(e => e.comment === 'lmai_memory'),
+            getLastRetrievalDebug: () => lastRetrievalDebug ? safeClone(lastRetrievalDebug) : null,
             getCacheStats: () => ({ meta: getMetaCache().stats, sim: getSimCache().stats }),
             incrementTurn: () => { MemoryState.currentTurn++; return MemoryState.currentTurn; },
             getCurrentTurn: () => MemoryState.currentTurn,
@@ -4133,34 +7066,39 @@
         }
 
         async function evalStandaloneCbsExpr(inner, runtime, args = []) {
-            let expr = safeTrim(inner); if (!expr) return "";
-            if (expr.includes("{{")) { expr = safeTrim(await renderStandaloneCbsText(expr, runtime, args)); if (!expr) return ""; }
-            if (expr === "char" || expr === "Char") return safeTrim(runtime?.char?.name || "Char");
-            if (expr === "user" || expr === "User") return runtime?.userName || "User";
-            const parts = splitTopLevelCbsByDoubleColon(expr).map((s) => String(s ?? ""));
-            const head = safeTrim(parts[0] || "");
-            if (head === "arg") { const index = Math.max(0, (parseInt(safeTrim(parts[1] || "1"), 10) || 1) - 1); return args[index] ?? "null"; }
-            if (head === "getvar") { const keyRaw = parts.slice(1).join("::"); const key = safeTrim(await renderStandaloneCbsText(keyRaw, runtime, args)); if (!key) return "null"; if (Object.prototype.hasOwnProperty.call(runtime.vars, key)) return runtime.vars[key]; if (Object.prototype.hasOwnProperty.call(runtime.globalVars, key)) return runtime.globalVars[key]; return "null"; }
-            if (head === "calc") { const expression = await renderStandaloneCbsText(parts.slice(1).join("::"), runtime, args); return evalStandaloneCbsCalc(expression); }
-            if (head === "call") { runtime._callDepth = (runtime._callDepth || 0) + 1; if (runtime._callDepth > 20) { runtime._callDepth--; return "[ERROR:max recursion]"; } try { const fnName = safeTrim(await renderStandaloneCbsText(parts[1] || "", runtime, args)); const fnBody = runtime.functions[fnName]; if (!fnBody) return ""; const callArgs = []; for (let i = 2; i < parts.length; i += 1) callArgs.push(await renderStandaloneCbsText(parts[i], runtime, args)); return await renderStandaloneCbsText(fnBody, runtime, callArgs); } finally { runtime._callDepth--; } }
-            if (head === "none") return "";
-            if (head === "char_desc") return safeTrim(runtime?.char?.desc || runtime?.char?.description || "");
-            if (head === "ujb") return safeTrim(runtime?.db?.globalNote || "");
-            if (head === "system_note") return safeTrim(runtime?.db?.globalNote || "");
-            if (head === "random") { const choices = parts.slice(1); if (choices.length === 0) return ""; const randIdx = Math.floor(Math.random() * choices.length); return await renderStandaloneCbsText(choices[randIdx], runtime, args); }
-            if (head === "token_count") { const text = await renderStandaloneCbsText(parts.slice(1).join("::"), runtime, args); return String(TokenizerEngine.estimateTokens(text, 'simple')); }
-            if (["equal", "not_equal", "greater", "greater_equal", "less", "less_equal"].includes(head)) {
-                const v1 = await renderStandaloneCbsText(parts[1] || "", runtime, args), v2 = await renderStandaloneCbsText(parts[2] || "", runtime, args);
-                const n1 = Number(v1), n2 = Number(v2), isNum = !isNaN(n1) && !isNaN(n2);
-                switch(head) {
-                    case "equal": return v1 === v2 ? "1" : "0"; case "not_equal": return v1 !== v2 ? "1" : "0";
-                    case "greater": return (isNum ? n1 > n2 : v1 > v2) ? "1" : "0"; case "greater_equal": return (isNum ? n1 >= n2 : v1 >= v2) ? "1" : "0";
-                    case "less": return (isNum ? n1 < n2 : v1 < v2) ? "1" : "0"; case "less_equal": return (isNum ? n1 <= n2 : v1 <= v2) ? "1" : "0";
+            try {
+                let expr = safeTrim(inner); if (!expr) return "";
+                if (expr.includes("{{")) { expr = safeTrim(await renderStandaloneCbsText(expr, runtime, args)); if (!expr) return ""; }
+                if (expr === "char" || expr === "Char") return safeTrim(runtime?.char?.name || "Char");
+                if (expr === "user" || expr === "User") return runtime?.userName || "User";
+                const parts = splitTopLevelCbsByDoubleColon(expr).map((s) => String(s ?? ""));
+                const head = safeTrim(parts[0] || "");
+                if (head === "arg") { const index = Math.max(0, (parseInt(safeTrim(parts[1] || "1"), 10) || 1) - 1); return args[index] ?? "null"; }
+                if (head === "getvar") { const keyRaw = parts.slice(1).join("::"); const key = safeTrim(await renderStandaloneCbsText(keyRaw, runtime, args)); if (!key) return "null"; if (Object.prototype.hasOwnProperty.call(runtime.vars, key)) return runtime.vars[key]; if (Object.prototype.hasOwnProperty.call(runtime.globalVars, key)) return runtime.globalVars[key]; return "null"; }
+                if (head === "calc") { const expression = await renderStandaloneCbsText(parts.slice(1).join("::"), runtime, args); return evalStandaloneCbsCalc(expression); }
+                if (head === "call") { runtime._callDepth = (runtime._callDepth || 0) + 1; if (runtime._callDepth > 20) { runtime._callDepth--; return "[ERROR:max recursion]"; } try { const fnName = safeTrim(await renderStandaloneCbsText(parts[1] || "", runtime, args)); const fnBody = runtime.functions[fnName]; if (!fnBody) return ""; const callArgs = []; for (let i = 2; i < parts.length; i += 1) callArgs.push(await renderStandaloneCbsText(parts[i], runtime, args)); return await renderStandaloneCbsText(fnBody, runtime, callArgs); } finally { runtime._callDepth--; } }
+                if (head === "none") return "";
+                if (head === "char_desc") return safeTrim(runtime?.char?.desc || runtime?.char?.description || "");
+                if (head === "ujb") return safeTrim(runtime?.db?.globalNote || "");
+                if (head === "system_note") return safeTrim(runtime?.db?.globalNote || "");
+                if (head === "random") { const choices = parts.slice(1); if (choices.length === 0) return ""; const randIdx = Math.floor(Math.random() * choices.length); return await renderStandaloneCbsText(choices[randIdx], runtime, args); }
+                if (head === "token_count") { const text = await renderStandaloneCbsText(parts.slice(1).join("::"), runtime, args); return String(TokenizerEngine.estimateTokens(text, 'simple')); }
+                if (["equal", "not_equal", "greater", "greater_equal", "less", "less_equal"].includes(head)) {
+                    const v1 = await renderStandaloneCbsText(parts[1] || "", runtime, args), v2 = await renderStandaloneCbsText(parts[2] || "", runtime, args);
+                    const n1 = Number(v1), n2 = Number(v2), isNum = !isNaN(n1) && !isNaN(n2);
+                    switch(head) {
+                        case "equal": return v1 === v2 ? "1" : "0"; case "not_equal": return v1 !== v2 ? "1" : "0";
+                        case "greater": return (isNum ? n1 > n2 : v1 > v2) ? "1" : "0"; case "greater_equal": return (isNum ? n1 >= n2 : v1 >= v2) ? "1" : "0";
+                        case "less": return (isNum ? n1 < n2 : v1 < v2) ? "1" : "0"; case "less_equal": return (isNum ? n1 <= n2 : v1 <= v2) ? "1" : "0";
+                    }
                 }
+                if (Object.prototype.hasOwnProperty.call(runtime.vars, expr)) return runtime.vars[expr];
+                if (Object.prototype.hasOwnProperty.call(runtime.globalVars, expr)) return runtime.globalVars[expr];
+                return expr;
+            } catch (e) {
+                console.warn("[LIBRA] CBS Expr Eval Error:", e?.message);
+                return "";
             }
-            if (Object.prototype.hasOwnProperty.call(runtime.vars, expr)) return runtime.vars[expr];
-            if (Object.prototype.hasOwnProperty.call(runtime.globalVars, expr)) return runtime.globalVars[expr];
-            return expr;
         }
 
         async function evalBracketCbsExpr(inner, runtime, args = []) {
@@ -4323,7 +7261,7 @@ Extract the following information from the conversation and output in JSON forma
 1. 인물 정보 / Character Info (entities)
    - name: 이름/Name
    - appearance: { features: [], distinctiveMarks: [], clothing: [] }
-   - personality: { traits: [], likes: [], dislikes: [], fears: [] }
+   - personality: { traits: [], likes: [], dislikes: [], fears: [], sexualOrientation: "", sexualPreferences: [] }
    - background: { origin: "", occupation: "", history: [] }
    - status: { currentMood: "", currentLocation: "", healthStatus: "" }
 
@@ -4338,10 +7276,40 @@ Extract the following information from the conversation and output in JSON forma
    - exists: { magic: true/false, ki: true/false, ... }
    - systems: { leveling: true/false, skills: true/false, ... }
 
+[외형 추출 필수 규칙 / Mandatory Appearance Extraction Rules]
+- 캐릭터의 외형(appearance.features)에는 반드시 다음 항목을 포함하여 추출하십시오:
+  For each character, you MUST extract and include the following in appearance.features:
+  * 머리색/Hair color (e.g. "검은 머리", "은발", "blonde hair")
+  * 머리모양/Hair style (e.g. "긴 생머리", "숏컷", "ponytail", "twin tails")
+  * 피부색/Skin tone (e.g. "하얀 피부", "갈색 피부", "fair skin")
+  * 눈 모양/Eye shape (e.g. "큰 눈", "날카로운 눈매", "round eyes")
+  * 눈 색/Eye color (e.g. "갈색 눈", "붉은 눈", "blue eyes")
+  * 키/Height (e.g. "키가 큰 편", "작은 키", "약 170cm", "tall")
+  * 체형/Body type (e.g. "마른 체형", "근육질", "슬림", "curvy", "athletic")
+  * 가슴 크기 (여성)/Breast size (female) (e.g. "큰 가슴", "빈유", "large bust")
+  * 성기 특징/Genital features (e.g. "큰 자지", "작은 음경", "large penis", "tight pussy")
+- 대화에서 직접 언급되지 않더라도, 캐릭터 설정이나 묘사에서 유추 가능한 경우 추출하십시오.
+  Even if not explicitly stated, extract if reasonably inferable from character descriptions.
+- 이미 저장된 정보에 해당 항목이 없으면 반드시 채우십시오.
+  If these fields are missing from stored info, you MUST fill them.
+
+[성격 필수 추출 규칙 / Mandatory Personality Extraction Rules]
+- 캐릭터의 성격(personality)에는 반드시 다음 항목을 포함하여 추출하십시오:
+  For each character, you MUST extract and include the following in personality:
+  * 성관념/Sexual attitudes (e.g. "개방적", "보수적", "순결주의", "open-minded", "conservative")
+  * 성적취향/Sexual preferences (e.g. "이성애", "양성애", "S성향", "M성향", "heterosexual", "bisexual", "dominant", "submissive")
+- sexualOrientation: 성관념을 문자열로 기술
+- sexualPreferences: 성적취향을 배열로 기술
+- 대화에서 직접 언급되지 않더라도, 캐릭터 설정이나 묘사에서 유추 가능한 경우 추출하십시오.
+
 [규칙 / Rules]
-- 명시적으로 언급된 정보만 추출 / Only extract explicitly mentioned information
+- 명시적으로 언급된 정보만 추출 / Only extract explicitly mentioned information (단, 위의 필수 외형 항목은 유추 가능하면 추출)
 - 기존 정보와 충돌하면 conflict 필드에 표시 / Mark conflicts with existing info in the conflict field
-- Respond in the same language as the conversation content
+
+[출력 언어 규칙 / Output Language Rules]
+- 이름(name, entityA, entityB)은 반드시 "한글(English)" 형식으로 작성하십시오. (e.g. "정수진(Jeong Sujin)", "히비키(Hibiki)")
+- 이름을 제외한 모든 서술(features, traits, status, relationType 등)은 반드시 영문으로 작성하십시오.
+- Names MUST be in "한글(English)" format. All other descriptions MUST be written in English.
 
 [출력 / Output]
 { "entities": [...], "relations": [...], "world": {...}, "conflicts": [...] }`;
@@ -4354,7 +7322,7 @@ Extract the following information from the conversation and output in JSON forma
             const normalized = {};
             const primaryClass = String(world?.classification?.primary || '').trim();
             if (primaryClass && WORLD_TEMPLATES[primaryClass]?.rules) {
-                Object.assign(normalized, JSON.parse(JSON.stringify(WORLD_TEMPLATES[primaryClass].rules)));
+                Object.assign(normalized, safeClone(WORLD_TEMPLATES[primaryClass].rules));
             }
             for (const key of ['exists', 'systems', 'physics', 'custom']) {
                 if (world?.[key] && typeof world[key] === 'object' && !Array.isArray(world[key])) {
@@ -4383,9 +7351,8 @@ Extract the following information from the conversation and output in JSON forma
             try {
                 const result = await LLMProvider.call(config, systemInstruction, userContent, { maxTokens: 1500 });
                 const content = Utils.stripLLMThinkingTags(result.content || '');
-                const jsonMatch = content.match(/\{[\s\S]*\}/);
-                if (!jsonMatch) throw new Error('No JSON found');
-                const parsed = JSON.parse(jsonMatch[0]);
+                const parsed = extractJson(content);
+                if (!parsed || typeof parsed !== 'object') throw new Error('No valid JSON found');
                 return { success: true, entities: parsed.entities || [], relations: parsed.relations || [], world: parsed.world || {}, conflicts: parsed.conflicts || [] };
             } catch (e) {
                 console.error('[LIBRA] Entity extraction failed:', e?.message);
@@ -4400,7 +7367,7 @@ Extract the following information from the conversation and output in JSON forma
 
             for (const entityData of entities || []) {
                 if (!entityData.name) continue;
-                const consistency = EntityManager.checkConsistency(entityData.name, entityData);
+                const consistency = EntityManager.checkConsistency(entityData.name, entityData, lore);
                 if (!consistency.consistent && config.debug) {
                     console.warn(`[LIBRA] Entity consistency warning:`, consistency.conflicts);
                 }
@@ -4693,25 +7660,92 @@ const WorldAdjustmentManager = (() => {
 // ══════════════════════════════════════════════════════════════
 // 마지막 사용자 메시지 캐시 (beforeRequest → afterRequest 전달용)
 let _lastUserMessage = '';
+let _lastUserMessageRaw = '';
 
-// 지연 초기화 (CHAT_START 대체 - beforeRequest 최초 호출 시 실행)
-const _lazyInit = async (lore) => {
-    if (MemoryState.isInitialized) return;
+const buildCanonicalUserPayload = (msg) => {
+    if (!msg || !(msg.role === 'user' || msg.is_user)) {
+        return { strict: '', raw: '' };
+    }
+    const raw = Utils.getMemorySourceText(Utils.getMessageText(msg));
+    const strict = getStrictNarrativeUserText(Utils.getMessageText(msg));
+    return { strict, raw };
+};
+
+const findLatestNarrativeUserText = (messages = []) => {
+    const list = Array.isArray(messages) ? messages : [];
+    for (let i = list.length - 1; i >= 0; i--) {
+        const msg = list[i];
+        if (!msg || !(msg.role === 'user' || msg.is_user)) continue;
+        const text = Utils.getNarrativeComparableText(Utils.getMessageText(msg), 'user');
+        if (text) return text;
+    }
+    return '';
+};
+
+const findLatestVisibleUserText = (messages = []) => {
+    const list = Array.isArray(messages) ? messages : [];
+    for (let i = list.length - 1; i >= 0; i--) {
+        const msg = list[i];
+        if (!msg || !(msg.role === 'user' || msg.is_user)) continue;
+        const text = Utils.getMemorySourceText(Utils.getMessageText(msg));
+        if (text) return text;
+    }
+    return '';
+};
+
+const findLatestUserMessage = (messages = []) => {
+    const list = Array.isArray(messages) ? messages : [];
+    for (let i = list.length - 1; i >= 0; i--) {
+        const msg = list[i];
+        if (msg && (msg.role === 'user' || msg.is_user)) return msg;
+    }
+    return null;
+};
+
+const resolveCanonicalUserPayload = (messages = []) => {
+    const primary = buildCanonicalUserPayload(findLatestUserMessage(messages));
+    if (primary.strict || primary.raw) return primary;
+    return {
+        strict: _lastUserMessage || '',
+        raw: _lastUserMessageRaw || _lastUserMessage || ''
+    };
+};
+
+const getStrictNarrativeUserText = (text) => {
+    const candidate = Utils.getNarrativeComparableText(text, 'user');
+    if (!candidate) return '';
+    if (Utils.isForcedBypassPrompt(candidate)) return '';
+    return candidate;
+};
+
+const reloadChatScopedRuntime = (lore, chatId = null, opts = {}) => {
+    const { resetSessionCaches = false, forceWorldReload = false } = opts;
+    if (resetSessionCaches) {
+        MemoryState.reset();
+        MemoryState.ignoredGreetingId = null;
+        MemoryState.isSessionRestored = false;
+        _lastUserMessage = '';
+        _lastUserMessageRaw = '';
+    }
     MemoryEngine.rebuildIndex(lore);
     EntityManager.rebuildCache(lore);
-    HierarchicalWorldManager.loadWorldGraph(lore);
+    HierarchicalWorldManager.loadWorldGraph(lore, forceWorldReload);
     NarrativeTracker.loadState(lore);
     StoryAuthor.loadState(lore);
+    Director.loadState(lore);
     CharacterStateTracker.loadState(lore);
     WorldStateTracker.loadState(lore);
+    MemoryEngine.setTurn(deriveMaxTurnFromLorebook(lore));
+    MemoryState._activeChatId = chatId || null;
+};
+
+// 지연 초기화 (CHAT_START 대체 - beforeRequest 최초 호출 시 실행)
+    const _lazyInit = async (lore) => {
+    if (MemoryState.isInitialized) return;
+    reloadChatScopedRuntime(lore, MemoryState._activeChatId, { forceWorldReload: false });
     const managed = MemoryEngine.getManagedEntries(lore);
-    let maxTurn = 0;
-    for (const entry of managed) {
-        const meta = MemoryEngine.getCachedMeta(entry);
-        if (meta.t > maxTurn) maxTurn = meta.t;
-    }
-    MemoryEngine.setTurn(maxTurn + 1);
     MemoryState.isInitialized = true;
+    TurnRecoveryEngine.startPolling();
     if (MemoryEngine.CONFIG.debug) {
         console.log(`[LIBRA] Lazy init. Turn: ${MemoryEngine.getCurrentTurn()}, Memories: ${managed.length}`);
         console.log(`[LIBRA] Entities: ${EntityManager.getEntityCache().size}, Relations: ${EntityManager.getRelationCache().size}`);
@@ -4721,55 +7755,91 @@ const _lazyInit = async (lore) => {
 if (typeof risuai !== 'undefined') {
     // beforeRequest: OpenAI 메시지 배열에 컨텍스트 주입
     risuai.addRisuReplacer('beforeRequest', async (messages, type) => {
+        // 메시지 배열 유효성 검증
+        const safeMessages = (Array.isArray(messages) ? messages : []).filter(m => m && typeof m === 'object' && m.role);
         try {
-            const char = await risuai.getCharacter();
-            if (!char) return messages;
-
-            const chat = char.chats?.[char.chatPage];
-            if (!chat) return messages;
-
-            if (await MemoryEngine.normalizeLoreStorage(char, chat)) {
-                await risuai.setCharacter(char);
+            if (!Utils.isNarrativeRequestType(type)) {
+                if (MemoryEngine.CONFIG?.debug) {
+                    console.log(`[LIBRA] beforeRequest skipped for non-primary request type: ${type}`);
+                }
+                return safeMessages;
             }
 
-            const lore = MemoryEngine.getLorebook(char, chat);
-            const effectiveLore = MemoryEngine.getEffectiveLorebook(char, chat);
+            const char = await risuai.getCharacter();
+            if (!char) return safeMessages;
+            let db = null; try { db = await risuai.getDatabase(); } catch {}
+            EntityManager.refreshIdentity(char, db);
 
-            // 원본 메시지 배열을 보호하기 위해 함수 시작 시 복사본 생성
-            const result = messages.map(m => ({ ...m }));
+            const chat = char.chats?.[char.chatPage];
+            if (!chat) return safeMessages;
+
+            if (await MemoryEngine.normalizeLoreStorage(char, chat)) {
+                await persistLoreToActiveChat(chat, MemoryEngine.getLorebook(char, chat));
+            }
+
+            let lore = MemoryEngine.getLorebook(char, chat);
+            let effectiveLore = MemoryEngine.getEffectiveLorebook(char, chat);
+
+            // 원본 메시지 배열을 보호하기 위해 함수 시작 시 복사본 생성 (유효한 메시지만)
+            const result = safeMessages.map(m => ({ ...m }));
 
             // 지연 초기화
             await _lazyInit(lore);
 
-            // 1. 자동 롤백 및 동기화 실행 (삭제/스와이프 감지)
-            await SyncEngine.syncMemory(char, chat, lore);
-
             // 세션 변경 감지: 다른 채팅방으로 전환된 경우 모든 캐시 강제 재구축
             const _chatId = chat?.id || null;
             if (MemoryState._activeChatId !== _chatId) {
-                MemoryState._activeChatId = _chatId;
-                HierarchicalWorldManager.loadWorldGraph(lore, true);
-                EntityManager.rebuildCache(lore);
-                NarrativeTracker.loadState(lore);
-                StoryAuthor.loadState(lore);
-                CharacterStateTracker.loadState(lore);
-                WorldStateTracker.loadState(lore);
+                reloadChatScopedRuntime(lore, _chatId, { resetSessionCaches: true, forceWorldReload: true });
+                enterRefreshRecoveryWindow();
                 MemoryState.currentSessionId = `sess_${_chatId || 'global'}_${Date.now()}`;
             } else {
                 HierarchicalWorldManager.loadWorldGraph(lore);
                 if (EntityManager.getEntityCache().size === 0) {
-                    EntityManager.rebuildCache(lore);
+                    reloadChatScopedRuntime(lore, _chatId, { forceWorldReload: false });
                 }
             }
 
-            let userMessage = result.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
+            const checkpointRestored = await RefreshCheckpointManager.restoreIfAhead(char, chat, lore);
+            if (checkpointRestored) {
+                lore = MemoryEngine.getLorebook(char, chat);
+                effectiveLore = MemoryEngine.getEffectiveLorebook(char, chat);
+                enterRefreshRecoveryWindow();
+            }
+
+            // 1. 자동 롤백 및 동기화 실행 (삭제/스와이프 감지)
+            if (!isRefreshStabilizing()) {
+                await SyncEngine.syncMemory(char, chat, lore);
+                await TurnRecoveryEngine.recoverIfNeeded('beforeRequest');
+            } else if (MemoryEngine.CONFIG.debug) {
+                console.log('[LIBRA] beforeRequest sync/recovery delayed during refresh stabilization window');
+            }
+
+            const latestRequestUser = result.filter(m => m?.role === 'user').slice(-1)[0] || null;
+            let userMessage = latestRequestUser?.content || '';
             if (MemoryEngine.CONFIG.cbsEnabled && typeof CBSEngine !== 'undefined') {
                 userMessage = await CBSEngine.process(userMessage);
-                const lastUserIdx = result.map(m => m.role).lastIndexOf('user');
+                const lastUserIdx = result.map(m => m?.role).lastIndexOf('user');
                 if (lastUserIdx >= 0) result[lastUserIdx].content = userMessage;
             }
-            userMessage = Utils.getLibraComparableText(userMessage);
-            _lastUserMessage = userMessage;
+            let canonicalUser = buildCanonicalUserPayload({ role: 'user', content: userMessage });
+            if (!canonicalUser.strict && !canonicalUser.raw) {
+                canonicalUser = buildCanonicalUserPayload(findLatestUserMessage(getChatMessages(chat)));
+            }
+            userMessage = canonicalUser.strict;
+            _lastUserMessage = canonicalUser.strict || '';
+            _lastUserMessageRaw = canonicalUser.raw || '';
+
+            const directorPrompt = Director.formatForPrompt();
+            const allowDirectorOverride = !!(MemoryEngine.CONFIG.directorEnabled && directorPrompt);
+            if (Utils.shouldBypassNarrativeSystems(userMessage, '') && !allowDirectorOverride) {
+                if (MemoryEngine.CONFIG.debug) {
+                    const hasNarrativePayload = Utils.hasSubstantialNarrativePayload(userMessage, 'user');
+                    console.log(`[LIBRA] beforeRequest bypassed for meta/tool-style prompt | hasNarrativePayload=${hasNarrativePayload} | userChars=${String(userMessage || '').length}`);
+                }
+                _lastUserMessage = '';
+                _lastUserMessageRaw = '';
+                return result;
+            }
 
             // 언급된 엔티티 찾기
             const mentionedEntities = [];
@@ -4797,6 +7867,7 @@ if (typeof risuai !== 'undefined') {
                 : '';
 
             // 기억 및 로어북 동적 검색 (RAG)
+            const embedBeforeMemory = getEmbeddingDebugSnapshotSafe();
             const memoryCandidates = MemoryEngine.getManagedEntries(lore);
             const memories = await MemoryEngine.retrieveMemories(
                 userMessage, MemoryEngine.getCurrentTurn(), memoryCandidates, {}, 10
@@ -4824,30 +7895,67 @@ if (typeof risuai !== 'undefined') {
                     }
                 }
             }
+            const embedAfterMemory = getEmbeddingDebugSnapshotSafe();
 
             // 컨텍스트 구성
             const contextParts = [];
-            if (worldPrompt) contextParts.push(worldPrompt);
-            if (lorebookText) contextParts.push('[로어북 설정 / Reference Lorebook]\n' + lorebookText);
-            if (entityPrompt) contextParts.push('[인물 정보 / Character Info]\n' + entityPrompt);
-            if (relationPrompt) contextParts.push('[관계 정보 / Relationship Info]\n' + relationPrompt);
-            if (memories.length > 0) contextParts.push('[관련 기억 / Related Memories]\n' + memoryText);
+            const injectedSections = [];
+            if (directorPrompt) {
+                contextParts.push(directorPrompt);
+                injectedSections.push(`director(${directorPrompt.length})`);
+            }
+            if (worldPrompt) {
+                contextParts.push(worldPrompt);
+                injectedSections.push(`world(${worldPrompt.length})`);
+            }
+            if (lorebookText) {
+                const section = '[로어북 설정 / Reference Lorebook]\n' + lorebookText;
+                contextParts.push(section);
+                injectedSections.push(`lorebook(${lorebookText.length})`);
+            }
+            if (entityPrompt) {
+                const section = '[인물 정보 / Character Info]\n' + entityPrompt;
+                contextParts.push(section);
+                injectedSections.push(`entities(${mentionedEntities.length}/${entityPrompt.length})`);
+            }
+            if (relationPrompt) {
+                const section = '[관계 정보 / Relationship Info]\n' + relationPrompt;
+                contextParts.push(section);
+                injectedSections.push(`relations(${relationPrompt.length})`);
+            }
+            if (memories.length > 0) {
+                const section = '[관련 기억 / Related Memories]\n' + memoryText;
+                contextParts.push(section);
+                injectedSections.push(`memories(${memories.length}/${memoryText.length})`);
+            }
 
             // Narrative context
             const narrativePrompt = NarrativeTracker.formatForPrompt();
-            if (narrativePrompt) contextParts.push(narrativePrompt);
+            if (narrativePrompt) {
+                contextParts.push(narrativePrompt);
+                injectedSections.push(`narrative(${narrativePrompt.length})`);
+            }
             const storyAuthorPrompt = StoryAuthor.formatForPrompt();
-            if (storyAuthorPrompt) contextParts.push(storyAuthorPrompt);
+            if (storyAuthorPrompt) {
+                contextParts.push(storyAuthorPrompt);
+                injectedSections.push(`storyAuthor(${storyAuthorPrompt.length})`);
+            }
 
             // Character state context
             for (const entity of mentionedEntities) {
                 const statePrompt = CharacterStateTracker.formatForPrompt(entity.name);
-                if (statePrompt) contextParts.push(`[${entity.name} State]\n${statePrompt}`);
+                if (statePrompt) {
+                    contextParts.push(`[${entity.name} State]\n${statePrompt}`);
+                    injectedSections.push(`charState:${entity.name}(${statePrompt.length})`);
+                }
             }
 
             // World state context
             const worldStatePrompt = WorldStateTracker.formatForPrompt();
-            if (worldStatePrompt) contextParts.push('[World State History]\n' + worldStatePrompt);
+            if (worldStatePrompt) {
+                contextParts.push('[World State History]\n' + worldStatePrompt);
+                injectedSections.push(`worldState(${worldStatePrompt.length})`);
+            }
 
             const instructions = [
                 '[지시사항 / Instructions]',
@@ -4859,25 +7967,27 @@ if (typeof risuai !== 'undefined') {
                 '6. 세계관의 물리 법칙과 시스템 규칙을 위반하지 마세요. / Do not violate world physics and system rules.'
             ].join('\n');
             contextParts.push(instructions);
+            injectedSections.push(`instructions(${instructions.length})`);
 
             if (contextParts.length === 0) return result;
             const contextStr = contextParts.join('\n\n');
 
             // 시스템 메시지에 컨텍스트 주입
-            const sysIdx = result.findIndex(m => m.role === 'system');
+            const sysIdx = result.findIndex(m => m?.role === 'system');
             if (sysIdx >= 0) {
-                result[sysIdx].content = result[sysIdx].content + '\n\n' + contextStr;
+                result[sysIdx].content = (result[sysIdx].content || '') + '\n\n' + contextStr;
             } else {
                 result.unshift({ role: 'system', content: contextStr });
             }
 
             // Add context reminder before last user message
             if (contextParts.length > 1) {
-                const lastUserIdx = result.map(m => m.role).lastIndexOf('user');
+                const lastUserIdx = result.map(m => m?.role).lastIndexOf('user');
                 if (lastUserIdx > 0) {
                     result.splice(lastUserIdx, 0, {
                         role: 'system',
                         content: '[Librarian System Context Reminder]\n' +
+                            (directorPrompt ? directorPrompt + '\n' : '') +
                             (narrativePrompt ? narrativePrompt + '\n' : '') +
                             (storyAuthorPrompt ? storyAuthorPrompt + '\n' : '') +
                             (mentionedEntities.length > 0 ? 'Active characters: ' + mentionedEntities.map(e => e.name).join(', ') + '\n' : '') +
@@ -4887,30 +7997,56 @@ if (typeof risuai !== 'undefined') {
             }
 
             if (MemoryEngine.CONFIG.debug) {
+                const memoryDebug = MemoryEngine.getLastRetrievalDebug();
                 console.log('[LIBRA] World:', HierarchicalWorldManager.getActivePath());
                 console.log('[LIBRA] Entities:', mentionedEntities.length);
+                if (memoryDebug) {
+                    const topSummary = (memoryDebug.topEntries || [])
+                        .map((item, idx) => `#${idx + 1} imp=${item.importance} sim=${item.similarity} rec=${item.recency} final=${item.finalScore} t=${item.turn} "${item.preview}"`)
+                        .join(' || ');
+                    console.log(
+                        `[LIBRA] Memory Retrieval: candidates=${memoryDebug.originalCandidates} -> filtered=${memoryDebug.filteredCandidates} -> selected=${memoryDebug.selectedCount} | belowSimThreshold=${memoryDebug.belowThresholdCount} | threshold=${memoryDebug.threshold} | simThreshold=${memoryDebug.simThreshold} | weights=${JSON.stringify(memoryDebug.weights)}`
+                    );
+                    if (topSummary) {
+                        console.log(`[LIBRA] Memory Top Scores: ${topSummary}`);
+                    }
+                }
+                console.log(
+                    `[LIBRA] Embedding Activity: configured=${!!(MemoryEngine.CONFIG.embed?.url && MemoryEngine.CONFIG.embed?.key)} | used=${embedAfterMemory.totalCalls > embedBeforeMemory.totalCalls} | providerCalls=${Math.max(0, embedAfterMemory.providerCalls - embedBeforeMemory.providerCalls)} | cacheHits=${Math.max(0, embedAfterMemory.cacheHits - embedBeforeMemory.cacheHits)} | provider=${embedAfterMemory.lastProvider || MemoryEngine.CONFIG.embed?.provider || 'openai'} | model=${embedAfterMemory.lastModel || MemoryEngine.CONFIG.embed?.model || ''} | lastStatus=${embedAfterMemory.lastStatus} | dims=${embedAfterMemory.lastDims || 0}`
+                );
+                console.log(`[LIBRA] Injected Sections: ${injectedSections.join(' | ') || 'none'} | totalChars=${contextStr.length}`);
             }
 
-
-            return result;
+            // Final safety filter to prevent RisuAI core crash
+            const finalResult = (Array.isArray(result) ? result : []).filter(m => m && typeof m === 'object' && m.role);
+            return finalResult.length > 0 ? finalResult : safeMessages;
         } catch (e) {
             console.error('[LIBRA] beforeRequest Error:', e?.message || e);
-            return messages;
+            return safeMessages;
         }
     });
 
     // afterRequest: 기억 저장 및 엔티티 업데이트
     risuai.addRisuReplacer('afterRequest', async (content, type) => {
         try {
+            if (!Utils.isNarrativeRequestType(type)) {
+                if (MemoryEngine.CONFIG?.debug) {
+                    console.log(`[LIBRA] afterRequest skipped for non-primary request type: ${type}`);
+                }
+                return content;
+            }
+
             const char = await risuai.getCharacter();
             if (!char) return content;
+            let db = null; try { db = await risuai.getDatabase(); } catch {}
+            EntityManager.refreshIdentity(char, db);
 
             const chat = char.chats?.[char.chatPage];
             const msgs_all = getChatMessages(chat);
             if (!chat || msgs_all.length === 0) return content;
 
             if (await MemoryEngine.normalizeLoreStorage(char, chat)) {
-                await risuai.setCharacter(char);
+                await persistLoreToActiveChat(chat, MemoryEngine.getLorebook(char, chat));
             }
 
             // 인사말 필터링: 자동 생성된 첫 인사말은 분석에서 제외
@@ -4920,224 +8056,52 @@ if (typeof risuai !== 'undefined') {
                 return content;
             }
 
-            MemoryEngine.incrementTurn();
-
-            const userMsg = _lastUserMessage;
+            const priorMsgs = msgs_all.slice(0, Math.max(0, msgs_all.length - 1));
+            const canonicalUser = resolveCanonicalUserPayload(priorMsgs);
+            const userMsgForNarrative = canonicalUser.strict;
+            const userMsgForMemory = canonicalUser.raw || canonicalUser.strict;
             const aiResponseRaw = String(content || '');
-            const aiResponse = Utils.getLibraComparableText(aiResponseRaw);
+            const aiResponse = Utils.getNarrativeComparableText(aiResponseRaw, 'ai');
+            const isAutoContinueTurn = !userMsgForNarrative && !userMsgForMemory && !!aiResponse;
+            const allowNarrativeProcessing = (!!aiResponse && !Utils.shouldBypassNarrativeSystems(userMsgForNarrative, aiResponse)) || isAutoContinueTurn;
+            const allowMemoryCapture = !!aiResponse && (isAutoContinueTurn || !!userMsgForMemory || !!userMsgForNarrative);
 
-            if (!userMsg && !aiResponse) return content;
-
-            const lore = MemoryEngine.getLorebook(char, chat);
-            const config = MemoryEngine.CONFIG;
-            const conversationEmotion = config.emotionEnabled ? EmotionEngine.analyze(`${userMsg}\n${aiResponse}`) : null;
-            const conversationEmotionNote = config.emotionEnabled ? EmotionEngine.formatSummary(conversationEmotion, 0.35) : '';
+            if (!allowNarrativeProcessing && !allowMemoryCapture) {
+                if (MemoryEngine.CONFIG.debug) {
+                    console.log('[LIBRA] afterRequest bypassed for meta/tool-style turn');
+                }
+                return content;
+            }
 
             // 세션 변경 감지: 다른 채팅방으로 전환된 경우 모든 캐시 강제 재구축
             const _chatId = chat?.id || null;
+            const lore = MemoryEngine.getLorebook(char, chat);
             if (MemoryState._activeChatId !== _chatId) {
-                MemoryState._activeChatId = _chatId;
-                HierarchicalWorldManager.loadWorldGraph(lore, true);
-                EntityManager.rebuildCache(lore);
-                NarrativeTracker.loadState(lore);
-                StoryAuthor.loadState(lore);
-                CharacterStateTracker.loadState(lore);
-                WorldStateTracker.loadState(lore);
+                reloadChatScopedRuntime(lore, _chatId, { resetSessionCaches: true, forceWorldReload: true });
+                enterRefreshRecoveryWindow();
                 MemoryState.currentSessionId = `sess_${_chatId || 'global'}_${Date.now()}`;
             } else {
                 HierarchicalWorldManager.loadWorldGraph(lore);
             }
 
-            // 복잡 세계관 감지
-            const complexAnalysis = ComplexWorldDetector.analyze(userMsg, aiResponse);
-
-            if (config.debug && complexAnalysis.hasComplexElements) {
-                console.log('[LIBRA] Complex indicators:', complexAnalysis.indicators);
-                console.log('[LIBRA] Dimensional shifts:', complexAnalysis.dimensionalShifts);
-            }
-
-            // 차원 이동 처리
-            for (const shift of complexAnalysis.dimensionalShifts) {
-                if (!shift.to) continue;
-                const profile = HierarchicalWorldManager.getProfile();
-                if (!profile?.nodes) continue;
-                let targetNode = null;
-
-                for (const [id, node] of profile.nodes) {
-                    if (node.name.includes(shift.to) || shift.to.includes(node.name)) {
-                        targetNode = node;
-                        break;
-                    }
-                }
-
-                if (!targetNode) {
-                    const createResult = HierarchicalWorldManager.createNode({
-                        name: shift.to,
-                        layer: 'dimension',
-                        parent: profile.rootId,
-                        source: 'auto_detected'
-                    });
-                    if (createResult.success) {
-                        targetNode = createResult.node;
-                        if (config.debug) console.log('[LIBRA] New dimension created:', shift.to);
-                    }
-                }
-
-                if (targetNode) {
-                    HierarchicalWorldManager.changeActivePath(targetNode.id, { method: shift.type });
-                }
-            }
-
-            // 전역 설정 업데이트
-            const profile = HierarchicalWorldManager.getProfile();
-            if (complexAnalysis.indicators.multiverse && !profile.global.multiverse) {
-                profile.global.multiverse = true;
-                profile.global.dimensionTravel = true;
-            }
-            if (complexAnalysis.indicators.timeTravel) profile.global.timeTravel = true;
-            if (complexAnalysis.indicators.metaNarrative) profile.global.metaNarrative = true;
-
-            // 엔티티 정보 추출
-            const storedInfo = EntityAwareProcessor.formatStoredInfo();
-            const entityResult = await EntityAwareProcessor.extractFromConversation(
-                userMsg, aiResponse, storedInfo, config
-            );
-
-            const m_id = aiMsg?.id;
-
-            if (entityResult.success) {
-                for (const entityData of entityResult.entities || []) {
-                    if (!entityData.name) continue;
-                    const consistency = EntityManager.checkConsistency(entityData.name, entityData);
-                    if (!consistency.consistent && config.debug) {
-                        console.warn(`[LIBRA] Entity consistency warning:`, consistency.conflicts);
-                    }
-                }
-                await EntityAwareProcessor.applyExtractions(entityResult, lore, config, m_id);
-            }
-
-            // Record narrative
-            const involvedEntities = (entityResult.success && entityResult.entities)
-                ? entityResult.entities.map(e => e.name).filter(Boolean)
-                : [];
-            NarrativeTracker.recordTurn(MemoryEngine.getCurrentTurn(), userMsg, aiResponse, involvedEntities);
-
-            // Track character states (synchronous recording first)
-            const entitiesToConsolidate = new Set();
-            if (entityResult.success) {
-                for (const entityData of entityResult.entities || []) {
-                    if (!entityData.name || !entityData.status) continue;
-                    const statusForRecord = {
-                        ...entityData.status,
-                        notes: [entityData.status.notes || '', conversationEmotionNote].filter(Boolean).join(' | ')
-                    };
-                    const isCritical = CharacterStateTracker.isCriticalMoment(entityData.name, statusForRecord);
-                    CharacterStateTracker.recordState(entityData.name, MemoryEngine.getCurrentTurn(), statusForRecord);
-                    if (isCritical) {
-                        CharacterStateTracker.recordCriticalMoment(entityData.name, MemoryEngine.getCurrentTurn(),
-                            `Critical change: ${JSON.stringify(statusForRecord)}`);
-                    }
-                    entitiesToConsolidate.add(entityData.name);
-                }
-            }
-
-            // Track world state (synchronous recording first)
-            const worldProfile = HierarchicalWorldManager.getProfile();
-            const currentRules = HierarchicalWorldManager.getCurrentRules();
-            const worldSnapshot = {
-                activePath: worldProfile?.activePath || [],
-                rules: currentRules,
-                global: worldProfile?.global || {},
-                notes: [
-                    complexAnalysis.hasComplexElements ? `Complex: ${Object.keys(complexAnalysis.indicators).join(',')}` : '',
-                    conversationEmotionNote
-                ].filter(Boolean).join(' | ')
-            };
-            const isWorldCritical = WorldStateTracker.isCriticalMoment(worldSnapshot);
-            WorldStateTracker.recordState(MemoryEngine.getCurrentTurn(), worldSnapshot);
-            if (isWorldCritical) {
-                WorldStateTracker.recordCriticalMoment(MemoryEngine.getCurrentTurn(),
-                    `World path changed: ${(worldSnapshot.activePath || []).join('→')}`);
-            }
-
-            // 일반 기억 저장
-            const memoryImportance = config.emotionEnabled
-                ? EmotionEngine.boostImportance(5, conversationEmotion)
-                : 5;
-            const newMemory = await MemoryEngine.prepareMemory(
-                { content: `[사용자] ${userMsg}\n[응답] ${aiResponse}`, importance: memoryImportance },
-                MemoryEngine.getCurrentTurn(), lore, lore, char, chat, m_id
-            );
-
-            if (newMemory) {
-                await loreLock.writeLock();
-                try {
-                    lore.push(newMemory);
-                    MemoryEngine.setLorebook(char, chat, lore);
-                    await risuai.setCharacter(char);
-                } finally {
-                    loreLock.writeUnlock();
-                }
-            }
-
-            // 트래커 등록 (m_id가 있을 경우)
-            if (m_id) {
-                const createdKeys = [];
-                if (newMemory) createdKeys.push(newMemory.key || TokenizerEngine.getSafeMapKey(newMemory.content));
-                // 엔티티와 관계 키는 EntityManager 캐시에서 이번 턴에 업데이트된 것들을 찾아야 함
-                // 일단 m_id 태그가 된 로어북 엔트리들을 다음 롤백 시점에 찾으므로 여기서는 최소한만 기록
-                MemoryState.rollbackTracker.set(m_id, {
-                    loreKeys: createdKeys,
-                    sourceHash: aiResponse ? TokenizerEngine.simpleHash(aiResponse) : null
-                });
-                MemoryState.transientMissing.delete(m_id);
-            }
-
-            // 유지보수성 요약/통합/저장은 응답 뒤 백그라운드에서 순차 처리
-            const turnForMaintenance = MemoryEngine.getCurrentTurn();
-            const maintenanceConfig = config;
-            const entityNamesForMaintenance = Array.from(entitiesToConsolidate);
-            if (config.debug) {
-                console.log(`[LIBRA] Scheduling background maintenance | turn=${turnForMaintenance} | entities=${entityNamesForMaintenance.length} | bgPending=${BackgroundMaintenanceQueue.pendingCount} | llmPending=${MaintenanceLLMQueue.pendingCount}`);
-            }
-            BackgroundMaintenanceQueue.enqueue(async () => {
-                const startedAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
-                try {
-                    const effectiveLoreForAuthor = MemoryEngine.getEffectiveLorebook(char, chat);
-                    await Promise.allSettled([
-                        NarrativeTracker.summarizeIfNeeded(turnForMaintenance, maintenanceConfig),
-                        StoryAuthor.updatePlanIfNeeded(turnForMaintenance, maintenanceConfig, userMsg, aiResponse, involvedEntities, effectiveLoreForAuthor),
-                        ...entityNamesForMaintenance.map(name =>
-                            CharacterStateTracker.consolidateIfNeeded(name, turnForMaintenance, maintenanceConfig)
-                        ),
-                        WorldStateTracker.consolidateIfNeeded(turnForMaintenance, maintenanceConfig)
-                    ]);
-
-                    const latestChar = await risuai.getCharacter();
-                    if (!latestChar) return;
-                    const latestChat = latestChar.chats?.[latestChar.chatPage];
-                    if (!latestChat) return;
-                    const latestLore = [...MemoryEngine.getLorebook(latestChar, latestChat)];
-
-                    await HierarchicalWorldManager.saveWorldGraph(latestChar, latestChat, latestLore);
-                    await EntityManager.saveToLorebook(latestChar, latestChat, latestLore);
-                    await NarrativeTracker.saveState(latestLore);
-                    await StoryAuthor.saveState(latestLore);
-                    await CharacterStateTracker.saveState(latestLore);
-                    await WorldStateTracker.saveState(latestLore);
-
-                    MemoryEngine.setLorebook(latestChar, latestChat, latestLore);
-                    await risuai.setCharacter(latestChar);
-                    if (maintenanceConfig.debug) {
-                        const finishedAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
-                        console.log(`[LIBRA] Background maintenance complete | turn=${turnForMaintenance} | duration=${Math.max(0, Math.round(finishedAt - startedAt))}ms | llmPending=${MaintenanceLLMQueue.pendingCount} | llmActive=${MaintenanceLLMQueue.activeCount}`);
-                    }
-                } catch (bgErr) {
-                    console.error('[LIBRA] Background maintenance error:', bgErr?.message || bgErr);
-                }
-            }, `afterRequest-turn-${turnForMaintenance}`).catch(e => {
-                console.error('[LIBRA] Background maintenance queue error:', e?.message || e);
+            PendingTurnManager.registerPending(chat, {
+                userMsgForNarrative,
+                userMsgForMemory,
+                aiResponse,
+                aiResponseRaw,
+                autoContinueTurn: isAutoContinueTurn,
+                allowNarrativeProcessing,
+                allowMemoryCapture,
+                aiHash: aiResponse ? TokenizerEngine.simpleHash(aiResponse) : null,
+                initialMessageId: aiMsg?.id || null,
+                requestType: type
             });
+            if (MemoryEngine.CONFIG.debug) {
+                console.log(`[LIBRA] Pending turn registered | chat=${chat?.id || 'global'} | aiHash=${TokenizerEngine.simpleHash(aiResponse || '')}`);
+            }
+
+            _lastUserMessage = '';
+            _lastUserMessageRaw = '';
 
             return content;
         } catch (e) {
@@ -5192,17 +8156,23 @@ const updateConfigFromArgs = async () => {
     cfg.useLorebookRAG = getVal('useLorebookRAG', 'use_lorebook_rag', 'boolean', null, true);
     cfg.emotionEnabled = getVal('emotionEnabled', 'emotion_enabled', 'boolean', null, true);
     cfg.storyAuthorEnabled = getVal('storyAuthorEnabled', 'story_author_enabled', 'boolean', null, true);
-    cfg.enableGigaTrans = getVal('enableGigaTrans', 'enable_gigatrans', 'boolean', null, false);
-    cfg.enableLightboard = getVal('enableLightboard', 'enable_lightboard', 'boolean', null, false);
     cfg.gcBatchSize = getVal('gcBatchSize', 'gc_batch_size', 'number', null, MEMORY_PRESETS.general.gcBatchSize);
     cfg.memoryPreset = getVal('memoryPreset', 'memory_preset', 'string', null, inferMemoryPreset(cfg));
     cfg.worldAdjustmentMode = getVal('worldAdjustmentMode', 'world_adjustment_mode', 'string', null, 'dynamic');
     cfg.storyAuthorMode = getVal('storyAuthorMode', 'story_author_mode', 'string', null, 'proactive');
+    cfg.directorEnabled = getVal('directorEnabled', 'director_enabled', 'boolean', null, true);
+    cfg.directorMode = getVal('directorMode', 'director_mode', 'string', null, 'strong');
     if (!cfg.storyAuthorEnabled || cfg.storyAuthorMode === 'disabled') {
         cfg.storyAuthorEnabled = false;
         cfg.storyAuthorMode = 'disabled';
     } else {
         cfg.storyAuthorEnabled = true;
+    }
+    if (!cfg.directorEnabled || cfg.directorMode === 'disabled') {
+        cfg.directorEnabled = false;
+        cfg.directorMode = 'disabled';
+    } else {
+        cfg.directorEnabled = true;
     }
 
     cfg.llm = {
@@ -5215,6 +8185,20 @@ const updateConfigFromArgs = async () => {
         reasoningEffort: getVal('reasoningEffort', 'llm_reasoning_effort', 'string', 'llm', 'none'),
         reasoningBudgetTokens: getVal('reasoningBudgetTokens', 'llm_reasoning_budget_tokens', 'number', 'llm', 0)
     };
+    cfg.auxLlm = {
+        enabled: getVal('enabled', 'aux_llm_enabled', 'boolean', 'auxLlm', false),
+        provider: getVal('provider', 'aux_llm_provider', 'string', 'auxLlm', cfg.llm.provider || 'openai'),
+        url: getVal('url', 'aux_llm_url', 'string', 'auxLlm', cfg.llm.url || ''),
+        key: getVal('key', 'aux_llm_key', 'string', 'auxLlm', ''),
+        model: getVal('model', 'aux_llm_model', 'string', 'auxLlm', cfg.llm.model || 'gpt-4o-mini'),
+        temp: getVal('temp', 'aux_llm_temp', 'number', 'auxLlm', 0.2),
+        timeout: getVal('timeout', 'aux_llm_timeout', 'number', 'auxLlm', 90000),
+        reasoningEffort: getVal('reasoningEffort', 'aux_llm_reasoning_effort', 'string', 'auxLlm', 'none'),
+        reasoningBudgetTokens: getVal('reasoningBudgetTokens', 'aux_llm_reasoning_budget_tokens', 'number', 'auxLlm', 0)
+    };
+    if (!cfg.auxLlm.enabled || !String(cfg.auxLlm.key || '').trim()) {
+        cfg.auxLlm.enabled = false;
+    }
 
     cfg.embed = {
         provider: getVal('provider', 'embed_provider', 'string', 'embed', 'openai'),
@@ -5223,7 +8207,6 @@ const updateConfigFromArgs = async () => {
         model: getVal('model', 'embed_model', 'string', 'embed', 'text-embedding-3-small'),
         timeout: getVal('timeout', 'embed_timeout', 'number', 'embed', 120000)
     };
-
     const mode = (getVal('weightMode', 'weight_mode', 'string', null, 'auto')).toLowerCase();
     cfg.weightMode = mode;
 
@@ -5238,7 +8221,7 @@ const updateConfigFromArgs = async () => {
 // Initialize
 (async () => {
     try {
-        console.log('[LIBRA] v2.4.0 Initializing...');
+        console.log('[LIBRA] v3.0.0 Initializing...');
         await updateConfigFromArgs();
 
         if (typeof risuai !== 'undefined') {
@@ -5257,28 +8240,40 @@ const updateConfigFromArgs = async () => {
                         EntityManager.rebuildCache(lore);
                         NarrativeTracker.loadState(lore);
                         StoryAuthor.loadState(lore);
+                        Director.loadState(lore);
                         CharacterStateTracker.loadState(lore);
                         WorldStateTracker.loadState(lore);
                         // 저장된 메모리 중 가장 최신 턴으로 setTurn 초기화
                         const managed = MemoryEngine.getManagedEntries(lore);
-                        let maxTurn = 0;
-                        for (const entry of managed) {
-                            const meta = MemoryEngine.getCachedMeta(entry);
-                            if (meta.t > maxTurn) maxTurn = meta.t;
-                        }
-                        MemoryEngine.setTurn(maxTurn + 1);
+                        const maxTurn = deriveMaxTurnFromLorebook(lore);
+                        MemoryEngine.setTurn(maxTurn);
                     }
                 }
             }
         }
 
         MemoryState.isInitialized = true;
-        const embedStatus = (cfg.embed?.url && cfg.embed?.key) ? `${cfg.embed.provider}/${cfg.embed.model}` : 'disabled (fallback to Jaccard)';
-        console.log(`[LIBRA] v2.4.0 Ready. LLM=${MemoryEngine.CONFIG.useLLM} | Mode=${MemoryEngine.CONFIG.weightMode} | Embed=${embedStatus}`);
+        // afterRequest-based memory commits depend on the recovery poller;
+        // when init completes before _lazyInit runs, start it explicitly here.
+        TurnRecoveryEngine.startPolling();
+        const activeCfg = MemoryEngine.CONFIG;
+        const embedStatus = (activeCfg.embed?.url && activeCfg.embed?.key) ? `${activeCfg.embed.provider}/${activeCfg.embed.model}` : 'disabled (fallback to Jaccard)';
+        console.log(`[LIBRA] v3.0.0 Ready. LLM=${activeCfg.useLLM} | Mode=${activeCfg.weightMode} | Embed=${embedStatus}`);
         
         // Memory Carry-Over 및 Cold Start 감지 실행
         if (typeof risuai !== 'undefined') {
             setTimeout(async () => {
+                try {
+                    const currentChar = await risuai.getCharacter();
+                    const currentChat = currentChar?.chats?.[currentChar?.chatPage];
+                    const currentLore = currentChat ? ((currentChat.localLore) || currentChar.lorebook || []) : [];
+                    if (currentChar && currentChat && Array.isArray(currentLore)) {
+                        await RefreshCheckpointManager.restoreIfAhead(currentChar, currentChat, currentLore);
+                    }
+                } catch (checkpointError) {
+                    console.warn('[LIBRA] Refresh checkpoint restore skipped:', checkpointError?.message || checkpointError);
+                }
+
                 const restored = await TransitionManager.restoreTransition();
                 if (!restored) {
                     await ColdStartManager.check();
@@ -5320,6 +8315,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
 .card:hover{border-color:var(--accent2)}
 .card-hdr{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:7px;gap:8px}
 .card-meta{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:5px}
+.hint{margin-top:6px;font-size:11px;color:var(--text2);line-height:1.45}
 .bdg{font-size:11px;padding:2px 7px;border-radius:10px;font-weight:500;white-space:nowrap}
 .bh{background:#2d4a2d;color:#5dbb5d}
 .bm{background:#4a3d1a;color:#c89c1a}
@@ -5400,7 +8396,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
     const GUI_BODY = `
 <div class="gui-wrap">
 <div class="hdr">
-  <h1>📚 LIBRA World Manager <span style="font-size:0.7rem; font-weight:normal; opacity:0.5;">v2.4.1</span></h1>
+  <h1>📚 LIBRA World Manager <span style="font-size:0.7rem; font-weight:normal; opacity:0.5;">v3.0.0</span></h1>
   <div class="tabs">
     <button class="tb on" data-tab="memory">📚 메모리</button>
     <button class="tb" data-tab="entity">👤 엔티티</button>
@@ -5451,6 +8447,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
       </div>
       <div class="fld"><label>외모 특징 (쉼표 구분)</label><input type="text" id="ae-feat" placeholder="검은 머리, 키 큰"></div>
       <div class="fld"><label>성격 특성 (쉼표 구분)</label><input type="text" id="ae-trait" placeholder="친절한, 용감한"></div>
+      <div class="fld"><label>성관념</label><input type="text" id="ae-sexual-orientation" placeholder="개방적, 보수적"></div>
+      <div class="fld"><label>성적취향 (쉼표 구분)</label><input type="text" id="ae-sexual-preferences" placeholder="이성애, S성향"></div>
       <div style="display:flex;gap:5px;margin-top:5px">
         <button class="btn bs" id="btn-add-ent">추가</button>
         <button class="btn bd" id="btn-cancel-ent">취소</button>
@@ -5515,6 +8513,18 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         <div class="fld"><label>Reasoning Budget Tokens</label><input type="number" id="slrb" placeholder="0"></div>
       </div>
       <div class="ss">
+        <h3>⚡ 보조 LLM 설정</h3>
+        <div class="tr"><label>듀얼 LLM 사용</label><label class="tog"><input type="checkbox" id="sax"><span class="tsl"></span></label></div>
+        <div class="fld"><label>Provider</label><select id="saxp"><option value="openai">OpenAI</option><option value="claude">Claude</option><option value="gemini">Gemini</option><option value="openrouter">OpenRouter</option><option value="vertex">Vertex</option><option value="copilot">Copilot</option><option value="custom">Custom</option></select></div>
+        <div class="fld"><label>URL</label><input type="text" id="saxu" placeholder="비우면 메인 URL 폴백"></div>
+        <div class="fld"><label>API Key</label><input type="password" id="saxk" placeholder="비우면 메인 LLM 사용"></div>
+        <div class="fld"><label>Model</label><input type="text" id="saxm" placeholder="gpt-4o-mini"></div>
+        <div class="fld"><label>Temperature</label><div class="rw"><input type="range" id="saxt" min="0" max="1" step="0.1"><span id="saxtv" class="rv">0.2</span></div></div>
+        <div class="fld"><label>Timeout (ms)</label><input type="number" id="saxto" placeholder="90000"></div>
+        <div class="fld"><label>Reasoning Effort</label><select id="saxre"><option value="none">사용 안 함</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div>
+        <div class="fld"><label>Reasoning Budget Tokens</label><input type="number" id="saxrb" placeholder="0"></div>
+      </div>
+      <div class="ss">
         <h3>🧠 Embedding 설정</h3>
         <div class="fld"><label>Provider</label><select id="sep"><option value="openai">OpenAI</option><option value="gemini">Gemini</option><option value="vertex">Vertex</option><option value="voyageai">VoyageAI</option><option value="custom">Custom</option></select></div>
         <div class="fld"><label>URL</label><input type="text" id="seu" placeholder="https://api.openai.com/v1/embeddings"></div>
@@ -5532,9 +8542,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
       </div>
       <div class="ss">
         <h3>📜 과거 대화 분석</h3>
-        <div class="fld"><label>분석 범위 프리셋</label><select id="scsp"><option value="all">전체</option><option value="partial_100">부분(100)</option><option value="partial_300">부분(300)</option></select></div>
+            <div class="fld"><label>분석 범위 프리셋</label><select id="scsp"><option value="all">전체</option><option value="partial_100">부분(100)</option><option value="partial_300">부분(300)</option></select></div>
         <div style="display:flex;gap:7px;flex-wrap:wrap">
           <button class="btn bp" id="btn-cold-start">🔄 과거 대화 분석</button>
+          <button class="btn bp" id="btn-cold-reanalyze">♻️ 과거 대화 재분석</button>
           <button class="btn bs" id="btn-import-hypa-v3">📥 하이파 V3 → 로어북</button>
         </div>
       </div>
@@ -5543,8 +8554,6 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         <div class="tr"><label>CBS 엔진 사용</label><label class="tog"><input type="checkbox" id="scbs" title="매크로 및 조건부 텍스트({{...}})를 처리합니다."><span class="tsl"></span></label></div>
         <div class="tr"><label>로어북 동적 참조 (RAG)</label><label class="tog"><input type="checkbox" id="slrag" title="일반 로어북의 설정도 검색하여 AI에게 전달합니다."><span class="tsl"></span></label></div>
         <div class="tr"><label>감정 분석 사용</label><label class="tog"><input type="checkbox" id="semo" title="감정 분석 엔진을 활성화합니다."><span class="tsl"></span></label></div>
-        <div class="tr"><label>GigaTrans 호환성</label><label class="tog"><input type="checkbox" id="sgt" title="GigaTrans 외부 모듈의 특수 태그를 정제합니다."><span class="tsl"></span></label></div>
-        <div class="tr"><label>라이트보드 호환성</label><label class="tog"><input type="checkbox" id="slb" title="라이트보드 외부 모듈의 특수 태그를 정제합니다."><span class="tsl"></span></label></div>
         <div class="tr"><label>디버그 모드</label><label class="tog"><input type="checkbox" id="sdb"><span class="tsl"></span></label></div>
       </div>
       <div class="ss">
@@ -5580,6 +8589,15 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             <option value="supportive">서포트형</option>
             <option value="proactive">주도형</option>
             <option value="aggressive">강공형</option>
+          </select>
+        </div>
+        <div class="fld"><label>감독 모드</label>
+          <select id="sdm">
+            <option value="disabled">비활성</option>
+            <option value="light">라이트</option>
+            <option value="standard">표준</option>
+            <option value="strong">강함</option>
+            <option value="absolute">절대감독</option>
           </select>
         </div>
       </div>
@@ -5640,7 +8658,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             if (narrativeEntry) {
                 _NAR = JSON.parse(narrativeEntry.content);
             } else {
-                _NAR = JSON.parse(JSON.stringify(NarrativeTracker.getState?.() || _NAR));
+                _NAR = safeClone(NarrativeTracker.getState?.() || _NAR);
             }
         } catch {}
 
@@ -5682,14 +8700,17 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             await loreLock.writeLock();
             try {
                 const targetChat = char.chats?.[char.chatPage];
-                if (Array.isArray(char.lorebook)) char.lorebook = newLore;
+                if (targetChat && Array.isArray(targetChat.localLore)) targetChat.localLore = newLore;
+                else if (Array.isArray(char.lorebook)) char.lorebook = newLore;
                 else if (targetChat) targetChat.localLore = newLore;
-                await R.setCharacter(char);
+                await persistLoreToActiveChat(targetChat, newLore);
                 lore = Array.isArray(newLore) ? [...newLore] : [];
                 MemoryEngine.rebuildIndex(lore);
                 HierarchicalWorldManager.loadWorldGraph(lore);
                 EntityManager.rebuildCache(lore);
                 NarrativeTracker.loadState(lore);
+                StoryAuthor.loadState(lore);
+                Director.loadState(lore);
                 CharacterStateTracker.loadState(lore);
                 WorldStateTracker.loadState(lore);
                 if (cb) cb();
@@ -5812,15 +8833,17 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 const content = stripMeta(m.content);
                 const idx = _MEM.indexOf(m);
                 const ttl = meta.ttl === -1 ? "영구" : (meta.ttl || 0) + "turn";
+                const originBadge = meta.source === 'narrative_source_record' ? `<span class="bdg bt">서사 요약 원본</span>` : '';
                 return `<div class="card" id="mc-${idx}">
                     <div class="card-hdr">
-                        <div class="card-meta">${impBdg(meta.imp||5)}<span class="bdg bt">턴 ${meta.t||0}</span><span class="bdg bt">TTL:${ttl}</span>${meta.cat ? `<span class="bdg bt">${esc(meta.cat)}</span>` : ''}</div>
+                        <div class="card-meta">${impBdg(meta.imp||5)}<span class="bdg bt">턴 ${meta.t||0}</span><span class="bdg bt">TTL:${ttl}</span>${originBadge}${meta.cat ? `<span class="bdg bt">${esc(meta.cat)}</span>` : ''}</div>
                         <div class="acts">
                             <button class="btn bp act-save-mem" data-idx="${idx}">저장</button>
                             <button class="btn bd act-del-mem" data-idx="${idx}">삭제</button>
                         </div>
                     </div>
                     <textarea class="ec mt-val" data-idx="${idx}" rows="3">${esc(content)}</textarea>
+                    ${meta.sourceHint ? `<div class="hint">${esc(meta.sourceHint)}</div>` : ''}
                     <div style="display:flex;gap:7px;align-items:center;margin-top:5px">
                         <label style="font-size:11px;color:var(--text2)">중요도:</label>
                         <input type="number" class="mi-val" data-idx="${idx}" min="1" max="10" value="${meta.imp||5}" style="width:55px">
@@ -5852,6 +8875,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                     const loc = (d.status && d.status.currentLocation) || "";
                     const feats = (d.appearance && d.appearance.features || []).join(", ");
                     const traits = (d.personality && d.personality.traits || []).join(", ");
+                    const sexualOrientation = (d.personality && d.personality.sexualOrientation) || "";
+                    const sexualPreferences = (d.personality && d.personality.sexualPreferences || []).join(", ");
                     return `<div class="card">
                         <div class="card-hdr"><strong>${esc(d.name || e.key || "?")}</strong>
                             <div class="acts"><button class="btn bp act-save-ent" data-idx="${i}">저장</button><button class="btn bd act-del-ent" data-idx="${i}">삭제</button></div>
@@ -5862,6 +8887,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                         </div>
                         <div class="fld" style="margin-top:5px"><label>외모 특징</label><input type="text" class="eF-val" data-idx="${i}" value="${escAttr(feats)}"></div>
                         <div class="fld"><label>성격 특성</label><input type="text" class="eP-val" data-idx="${i}" value="${escAttr(traits)}"></div>
+                        <div class="fld"><label>성관념</label><input type="text" class="eSO-val" data-idx="${i}" value="${escAttr(sexualOrientation)}"></div>
+                        <div class="fld"><label>성적취향</label><input type="text" class="eSP-val" data-idx="${i}" value="${escAttr(sexualPreferences)}"></div>
                     </div>`;
                 }).join("");
             }
@@ -5890,6 +8917,42 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             }
         };
 
+        const formatNarrativeRecentEvents = (storyline) => {
+            const events = Array.isArray(storyline?.recentEvents) ? storyline.recentEvents : [];
+            return events.map(evt => {
+                if (evt && typeof evt === 'object') {
+                    const turn = evt.turn ?? '?';
+                    const brief = String(evt.brief || '').trim();
+                    return brief ? `T${turn}: ${brief}` : '';
+                }
+                return String(evt || '').trim();
+            }).filter(Boolean).join("\n");
+        };
+
+        const formatNarrativeSummaryHistory = (storyline) => {
+            const summaries = Array.isArray(storyline?.summaries) ? storyline.summaries : [];
+            return summaries.map((entry, idx) => {
+                const turn = entry?.upToTurn ?? '?';
+                const summary = String(entry?.summary || '').trim();
+                const keyPoints = Array.isArray(entry?.keyPoints) && entry.keyPoints.length > 0
+                    ? ` | Key: ${entry.keyPoints.join('; ')}`
+                    : '';
+                const tensions = Array.isArray(entry?.ongoingTensions) && entry.ongoingTensions.length > 0
+                    ? ` | Flow: ${entry.ongoingTensions.join('; ')}`
+                    : '';
+                return `${idx + 1}. T${turn} | ${summary}${keyPoints}${tensions}`.trim();
+            }).filter(Boolean).join("\n");
+        };
+
+        const formatNarrativeTurnFlow = (storyline) => {
+            const turns = new Set(Array.isArray(storyline?.turns) ? storyline.turns : []);
+            const logs = Array.isArray(_NAR?.turnLog) ? _NAR.turnLog : [];
+            return logs
+                .filter(entry => turns.has(entry.turn))
+                .map(entry => `T${entry.turn} | User: ${String(entry.userAction || '').trim()} | AI: ${String(entry.summary || entry.response || '').trim()}`)
+                .join("\n\n");
+        };
+
         const renderNarrative = () => {
             const list = overlay.querySelector("#narrative-list");
             const counter = overlay.querySelector("#nc");
@@ -5903,7 +8966,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             list.innerHTML = storylines.map((storyline, i) => {
                 const entities = Array.isArray(storyline.entities) ? storyline.entities.join(", ") : "";
                 const keyPoints = Array.isArray(storyline.keyPoints) ? storyline.keyPoints.join(", ") : "";
-                const recentEvents = Array.isArray(storyline.recentEvents) ? storyline.recentEvents.join("\n") : "";
+                const recentEvents = formatNarrativeRecentEvents(storyline);
+                const ongoingFlow = Array.isArray(storyline.ongoingTensions) ? storyline.ongoingTensions.join(", ") : "";
+                const summaryHistory = formatNarrativeSummaryHistory(storyline);
+                const turnFlow = formatNarrativeTurnFlow(storyline);
                 const summary = Array.isArray(storyline.summaries) && storyline.summaries.length > 0
                     ? (storyline.summaries[storyline.summaries.length - 1]?.summary || "")
                     : "";
@@ -5919,8 +8985,11 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                     <div class="fld"><label>등장 인물 (쉼표 구분)</label><input type="text" class="nE-val" data-idx="${i}" value="${escAttr(entities)}"></div>
                     <div class="fld"><label>현재 맥락</label><textarea class="ec nC-val" data-idx="${i}" rows="3">${esc(storyline.currentContext || '')}</textarea></div>
                     <div class="fld"><label>핵심 포인트 (쉼표 구분)</label><input type="text" class="nK-val" data-idx="${i}" value="${escAttr(keyPoints)}"></div>
+                    <div class="fld"><label>진행 중 흐름 (쉼표 구분)</label><input type="text" class="nO-val" data-idx="${i}" value="${escAttr(ongoingFlow)}"></div>
                     <div class="fld"><label>최근 이벤트 (줄바꿈 구분)</label><textarea class="ec nR-val" data-idx="${i}" rows="4">${esc(recentEvents)}</textarea></div>
                     <div class="fld"><label>최근 요약</label><textarea class="ec nS-val" data-idx="${i}" rows="3">${esc(summary)}</textarea></div>
+                    <div class="fld"><label>요약 이력 (읽기 전용)</label><textarea class="ec" rows="6" readonly>${esc(summaryHistory)}</textarea></div>
+                    <div class="fld"><label>턴별 서사 흐름 (읽기 전용)</label><textarea class="ec" rows="8" readonly>${esc(turnFlow)}</textarea></div>
                 </div>`;
             }).join("");
         };
@@ -6022,11 +9091,18 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             overlay.querySelector("#slto").value = (c.llm && c.llm.timeout) || 120000;
             overlay.querySelector("#slre").value = (c.llm && c.llm.reasoningEffort) || "none";
             overlay.querySelector("#slrb").value = (c.llm && c.llm.reasoningBudgetTokens) || 0;
+            overlay.querySelector("#sax").checked = !!(c.auxLlm && c.auxLlm.enabled);
+            overlay.querySelector("#saxp").value = (c.auxLlm && c.auxLlm.provider) || (c.llm && c.llm.provider) || "openai";
+            overlay.querySelector("#saxu").value = (c.auxLlm && c.auxLlm.url) || "";
+            overlay.querySelector("#saxk").value = (c.auxLlm && c.auxLlm.key) || "";
+            overlay.querySelector("#saxm").value = (c.auxLlm && c.auxLlm.model) || (c.llm && c.llm.model) || "gpt-4o-mini";
+            const at = overlay.querySelector("#saxt"); at.value = (c.auxLlm && c.auxLlm.temp) || 0.2; overlay.querySelector("#saxtv").textContent = at.value;
+            overlay.querySelector("#saxto").value = (c.auxLlm && c.auxLlm.timeout) || 90000;
+            overlay.querySelector("#saxre").value = (c.auxLlm && c.auxLlm.reasoningEffort) || "none";
+            overlay.querySelector("#saxrb").value = (c.auxLlm && c.auxLlm.reasoningBudgetTokens) || 0;
             overlay.querySelector("#scbs").checked = c.cbsEnabled !== false;
             overlay.querySelector("#slrag").checked = c.useLorebookRAG !== false;
             overlay.querySelector("#semo").checked = c.emotionEnabled !== false;
-            overlay.querySelector("#sgt").checked = !!c.enableGigaTrans;
-            overlay.querySelector("#slb").checked = !!c.enableLightboard;
             overlay.querySelector("#sep").value = (c.embed && c.embed.provider) || "openai";
             overlay.querySelector("#seu").value = (c.embed && c.embed.url) || "";
             overlay.querySelector("#sek").value = (c.embed && c.embed.key) || "";
@@ -6047,6 +9123,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             applyWeightValuesToUI(c.weights || resolveWeightsForMode(c.weightMode, null));
             overlay.querySelector("#sam").value = c.worldAdjustmentMode || "dynamic";
             overlay.querySelector("#ssam").value = c.storyAuthorMode || "proactive";
+            overlay.querySelector("#sdm").value = c.directorEnabled === false ? "disabled" : (c.directorMode || "strong");
             overlay.querySelector("#sdb").checked = !!c.debug;
             
             const cacheStats = MemoryEngine.getCacheStats();
@@ -6090,6 +9167,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         // 슬라이더 값 실시간 반영
         const bindSlider = (id, targetId) => overlay.querySelector(id).oninput = (e) => overlay.querySelector(targetId).textContent = e.target.value;
         bindSlider('#slt', '#sltv');
+        bindSlider('#saxt', '#saxtv');
         bindSlider('#sst', '#sstv');
         bindSlider('#ar-cls', '#ar-clsv');
         bindSlider('#ar-trs', '#ar-trsv');
@@ -6104,11 +9182,11 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
 
         // 메모리 액션
         overlay.querySelector('#btn-add-mem').onclick = () => {
-            const c = overlay.querySelector("#am-c").value.trim();
+            const c = Utils.getMemorySourceText(overlay.querySelector("#am-c").value);
             if (!c) { toast("❌ 내용을 입력하세요"); return; }
             const imp = parseInt(overlay.querySelector("#am-i").value) || 5;
             const cat = overlay.querySelector("#am-cat").value.trim() || "";
-            const meta = { imp: Math.max(1, Math.min(10, imp)), t: 0, ttl: -1, cat: cat };
+            const meta = { imp: Math.max(1, Math.min(10, imp)), t: 0, ttl: -1, cat: cat, summary: '', source: 'narrative_source_record', sourceHint: 'Used as source evidence for narrative summaries.' };
             _MEM.push({ key: "", comment: "lmai_memory", content: `[META:${JSON.stringify(meta)}]\n${c}`, mode: "normal", insertorder: 100, alwaysActive: false });
             overlay.querySelector("#am-c").value = "";
             overlay.querySelector('#amf').classList.remove('on');
@@ -6138,25 +9216,27 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 name: normalizedName,
                 type: 'character',
                 appearance: {
-                    features: overlay.querySelector("#ae-feat").value.split(",").map(s => s.trim()).filter(Boolean),
+                    features: (overlay.querySelector("#ae-feat")?.value || '').split(",").map(s => s.trim()).filter(Boolean),
                     distinctiveMarks: [],
                     clothing: []
                 },
                 personality: {
-                    traits: overlay.querySelector("#ae-trait").value.split(",").map(s => s.trim()).filter(Boolean),
+                    traits: (overlay.querySelector("#ae-trait")?.value || '').split(",").map(s => s.trim()).filter(Boolean),
                     values: [],
                     fears: [],
                     likes: [],
-                    dislikes: []
+                    dislikes: [],
+                    sexualOrientation: (overlay.querySelector("#ae-sexual-orientation")?.value || '').trim(),
+                    sexualPreferences: (overlay.querySelector("#ae-sexual-preferences")?.value || '').split(",").map(s => s.trim()).filter(Boolean)
                 },
                 background: {
                     origin: '',
-                    occupation: overlay.querySelector("#ae-occ").value.trim(),
+                    occupation: (overlay.querySelector("#ae-occ")?.value || '').trim(),
                     history: [],
                     secrets: []
                 },
                 status: {
-                    currentLocation: overlay.querySelector("#ae-loc").value.trim(),
+                    currentLocation: (overlay.querySelector("#ae-loc")?.value || '').trim(),
                     currentMood: '',
                     healthStatus: '',
                     lastUpdated: MemoryState.currentTurn
@@ -6164,7 +9244,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 meta: { created: MemoryState.currentTurn, updated: MemoryState.currentTurn, confidence: 0.7, source: 'gui' }
             };
             _ENT.push({ key: LibraLoreKeys.entityFromName(normalizedName), comment: "lmai_entity", content: JSON.stringify(d), mode: "normal", insertorder: 50, alwaysActive: false });
-            overlay.querySelector("#ae-name").value = ""; overlay.querySelector("#ae-occ").value = ""; overlay.querySelector("#ae-loc").value = ""; overlay.querySelector("#ae-feat").value = ""; overlay.querySelector("#ae-trait").value = "";
+            overlay.querySelector("#ae-name").value = ""; overlay.querySelector("#ae-occ").value = ""; overlay.querySelector("#ae-loc").value = ""; overlay.querySelector("#ae-feat").value = ""; overlay.querySelector("#ae-trait").value = ""; overlay.querySelector("#ae-sexual-orientation").value = ""; overlay.querySelector("#ae-sexual-preferences").value = "";
             overlay.querySelector('#aef').classList.remove('on');
             renderEnts(); toast("✅ 인물 추가됨");
         };
@@ -6239,14 +9319,14 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             
             const coldStartScopePreset = overlay.querySelector("#scsp").value || 'partial_100';
             const storyAuthorMode = overlay.querySelector("#ssam").value || 'disabled';
+            const directorMode = overlay.querySelector("#sdm").value || 'disabled';
             const cfg = {
                 useLLM: true,
                 cbsEnabled: overlay.querySelector("#scbs").checked,
                 useLorebookRAG: overlay.querySelector("#slrag").checked,
                 emotionEnabled: overlay.querySelector("#semo").checked,
                 storyAuthorEnabled: storyAuthorMode !== 'disabled',
-                enableGigaTrans: overlay.querySelector("#sgt").checked,
-                enableLightboard: overlay.querySelector("#slb").checked,
+                directorEnabled: directorMode !== 'disabled',
                 debug: overlay.querySelector("#sdb").checked,
                 memoryPreset: overlay.querySelector("#smp").value || "custom",
                 maxLimit: parseInt(overlay.querySelector("#sml").value) || MEMORY_PRESETS.general.maxLimit,
@@ -6259,6 +9339,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 weights: resolveWeightsForMode(overlay.querySelector("#swm").value, customWeights),
                 worldAdjustmentMode: overlay.querySelector("#sam").value,
                 storyAuthorMode,
+                directorMode,
                 llm: {
                     provider: overlay.querySelector("#slp").value,
                     url: overlay.querySelector("#slu").value,
@@ -6268,6 +9349,17 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                     timeout: parseInt(overlay.querySelector("#slto").value) || 120000,
                     reasoningEffort: overlay.querySelector("#slre").value || "none",
                     reasoningBudgetTokens: parseInt(overlay.querySelector("#slrb").value) || 0
+                },
+                auxLlm: {
+                    enabled: overlay.querySelector("#sax").checked,
+                    provider: overlay.querySelector("#saxp").value,
+                    url: overlay.querySelector("#saxu").value,
+                    key: overlay.querySelector("#saxk").value,
+                    model: overlay.querySelector("#saxm").value,
+                    temp: parseFloat(overlay.querySelector("#saxt").value) || 0.2,
+                    timeout: parseInt(overlay.querySelector("#saxto").value) || 90000,
+                    reasoningEffort: overlay.querySelector("#saxre").value || "none",
+                    reasoningBudgetTokens: parseInt(overlay.querySelector("#saxrb").value) || 0
                 },
                 embed: {
                     provider: overlay.querySelector("#sep").value,
@@ -6287,7 +9379,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
 
         overlay.querySelector('#btn-reset-settings').onclick = () => {
             if (!confirm("모든 설정을 초기값으로 되돌리시겠습니까?")) return;
-            _CFG = { useLLM: true, cbsEnabled: true, useLorebookRAG: true, emotionEnabled: true, storyAuthorEnabled: true, storyAuthorMode: "proactive", enableGigaTrans: false, enableLightboard: false, debug: false, memoryPreset: "general", maxLimit: MEMORY_PRESETS.general.maxLimit, threshold: MEMORY_PRESETS.general.threshold, simThreshold: MEMORY_PRESETS.general.simThreshold, gcBatchSize: MEMORY_PRESETS.general.gcBatchSize, coldStartScopePreset: "partial_100", coldStartHistoryLimit: 100, weightMode: "auto", worldAdjustmentMode: "dynamic", llm: { provider: "openai", url: "", key: "", model: "gpt-4o-mini", temp: 0.3, timeout: 120000, reasoningEffort: "none", reasoningBudgetTokens: 0 }, embed: { provider: "openai", url: "", key: "", model: "text-embedding-3-small", timeout: 120000 } };
+            _CFG = { useLLM: true, cbsEnabled: true, useLorebookRAG: true, emotionEnabled: true, storyAuthorEnabled: true, storyAuthorMode: "proactive", directorEnabled: true, directorMode: "strong", debug: false, memoryPreset: "general", maxLimit: MEMORY_PRESETS.general.maxLimit, threshold: MEMORY_PRESETS.general.threshold, simThreshold: MEMORY_PRESETS.general.simThreshold, gcBatchSize: MEMORY_PRESETS.general.gcBatchSize, coldStartScopePreset: "partial_100", coldStartHistoryLimit: 100, weightMode: "auto", worldAdjustmentMode: "dynamic", llm: { provider: "openai", url: "", key: "", model: "gpt-4o-mini", temp: 0.3, timeout: 120000, reasoningEffort: "none", reasoningBudgetTokens: 0 }, auxLlm: { enabled: false, provider: "openai", url: "", key: "", model: "gpt-4o-mini", temp: 0.2, timeout: 90000, reasoningEffort: "none", reasoningBudgetTokens: 0 }, embed: { provider: "openai", url: "", key: "", model: "text-embedding-3-small", timeout: 120000 } };
             loadSettings(); toast("🔄 설정 초기화됨");
         };
 
@@ -6297,10 +9389,13 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             if (target.classList.contains('act-save-mem')) {
                 const idx = parseInt(target.dataset.idx, 10);
                 if (isNaN(idx) || idx < 0 || idx >= _MEM.length) return;
-                const nc = overlay.querySelector(".mt-val[data-idx='"+idx+"']").value;
-                const ni = parseInt(overlay.querySelector(".mi-val[data-idx='"+idx+"']").value) || 5;
+                const nc = Utils.getMemorySourceText(overlay.querySelector(".mt-val[data-idx='"+idx+"']")?.value || '');
+                const ni = parseInt(overlay.querySelector(".mi-val[data-idx='"+idx+"']")?.value) || 5;
                 const meta = parseMeta(_MEM[idx].content);
                 meta.imp = Math.max(1, Math.min(10, ni));
+                meta.summary = '';
+                meta.source = meta.source || 'narrative_source_record';
+                meta.sourceHint = meta.sourceHint || 'Used as source evidence for narrative summaries.';
                 _MEM[idx].content = `[META:${JSON.stringify(meta)}]\n${nc}`;
                 toast("✅ 메모리 수정됨");
             } else if (target.classList.contains('act-del-mem')) {
@@ -6312,10 +9407,13 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 const i = parseInt(target.dataset.idx, 10);
                 if (isNaN(i) || i < 0 || i >= _ENT.length) return;
                 let d = {}; try { d = JSON.parse(_ENT[i].content); } catch (x) {}
-                d.background = d.background || {}; d.background.occupation = overlay.querySelector(".eo-val[data-idx='"+i+"']").value;
-                d.status = d.status || {}; d.status.currentLocation = overlay.querySelector(".eL-val[data-idx='"+i+"']").value;
-                d.appearance = d.appearance || {}; d.appearance.features = overlay.querySelector(".eF-val[data-idx='"+i+"']").value.split(",").map(s => s.trim()).filter(Boolean);
-                d.personality = d.personality || {}; d.personality.traits = overlay.querySelector(".eP-val[data-idx='"+i+"']").value.split(",").map(s => s.trim()).filter(Boolean);
+                d.background = d.background || {}; d.background.occupation = overlay.querySelector(".eo-val[data-idx='"+i+"']")?.value || '';
+                d.status = d.status || {}; d.status.currentLocation = overlay.querySelector(".eL-val[data-idx='"+i+"']")?.value || '';
+                d.appearance = d.appearance || {}; d.appearance.features = (overlay.querySelector(".eF-val[data-idx='"+i+"']")?.value || '').split(",").map(s => s.trim()).filter(Boolean);
+                d.personality = d.personality || {};
+                d.personality.traits = (overlay.querySelector(".eP-val[data-idx='"+i+"']")?.value || '').split(",").map(s => s.trim()).filter(Boolean);
+                d.personality.sexualOrientation = (overlay.querySelector(".eSO-val[data-idx='"+i+"']")?.value || '').trim();
+                d.personality.sexualPreferences = (overlay.querySelector(".eSP-val[data-idx='"+i+"']")?.value || '').split(",").map(s => s.trim()).filter(Boolean);
                 _ENT[i].content = JSON.stringify(d); toast("✅ 인물 데이터 수정됨");
             } else if (target.classList.contains('act-del-ent')) {
                 const i = parseInt(target.dataset.idx, 10);
@@ -6326,10 +9424,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 const i = parseInt(target.dataset.idx, 10);
                 if (isNaN(i) || i < 0 || i >= _REL.length) return;
                 let d = {}; try { d = JSON.parse(_REL[i].content); } catch (x) {}
-                d.relationType = overlay.querySelector(".rT-val[data-idx='"+i+"']").value;
-                d.sentiments = d.sentiments || {}; d.sentiments.fromAtoB = overlay.querySelector(".rS-val[data-idx='"+i+"']").value;
-                d.details = d.details || {}; d.details.closeness = (parseInt(overlay.querySelector(".rC-val[data-idx='"+i+"']").value) || 0) / 100;
-                d.details.trust = (parseInt(overlay.querySelector(".rR-val[data-idx='"+i+"']").value) || 0) / 100;
+                d.relationType = overlay.querySelector(".rT-val[data-idx='"+i+"']")?.value || '';
+                d.sentiments = d.sentiments || {}; d.sentiments.fromAtoB = overlay.querySelector(".rS-val[data-idx='"+i+"']")?.value || '';
+                d.details = d.details || {}; d.details.closeness = (parseInt(overlay.querySelector(".rC-val[data-idx='"+i+"']")?.value) || 0) / 100;
+                d.details.trust = (parseInt(overlay.querySelector(".rR-val[data-idx='"+i+"']")?.value) || 0) / 100;
                 const floors = (() => {
                     const text = String(d.relationType || '').toLowerCase();
                     if (['연인', '애인', 'lover', 'romantic partner', 'spouse', 'wife', 'husband'].some(k => text.includes(k))) return { closeness: 0.75, trust: 0.75 };
@@ -6357,12 +9455,21 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 const i = parseInt(target.dataset.idx, 10);
                 if (isNaN(i) || i < 0 || i >= (_NAR.storylines || []).length) return;
                 const storyline = _NAR.storylines[i] || {};
-                storyline.name = overlay.querySelector(".nN-val[data-idx='"+i+"']").value.trim() || `Storyline ${i + 1}`;
-                storyline.entities = overlay.querySelector(".nE-val[data-idx='"+i+"']").value.split(",").map(s => s.trim()).filter(Boolean);
-                storyline.currentContext = overlay.querySelector(".nC-val[data-idx='"+i+"']").value.trim();
-                storyline.keyPoints = overlay.querySelector(".nK-val[data-idx='"+i+"']").value.split(",").map(s => s.trim()).filter(Boolean);
-                storyline.recentEvents = overlay.querySelector(".nR-val[data-idx='"+i+"']").value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-                const latestSummary = overlay.querySelector(".nS-val[data-idx='"+i+"']").value.trim();
+                storyline.name = (overlay.querySelector(".nN-val[data-idx='"+i+"']")?.value || '').trim() || `Storyline ${i + 1}`;
+                storyline.entities = (overlay.querySelector(".nE-val[data-idx='"+i+"']")?.value || '').split(",").map(s => s.trim()).filter(Boolean);
+                storyline.currentContext = (overlay.querySelector(".nC-val[data-idx='"+i+"']")?.value || '').trim();
+                storyline.keyPoints = (overlay.querySelector(".nK-val[data-idx='"+i+"']")?.value || '').split(",").map(s => s.trim()).filter(Boolean);
+                storyline.ongoingTensions = (overlay.querySelector(".nO-val[data-idx='"+i+"']")?.value || '').split(",").map(s => s.trim()).filter(Boolean);
+                storyline.recentEvents = (overlay.querySelector(".nR-val[data-idx='"+i+"']")?.value || '')
+                    .split(/\r?\n/)
+                    .map(s => s.trim())
+                    .filter(Boolean)
+                    .map((line, idx) => {
+                        const match = line.match(/^T(\d+)\s*:\s*(.+)$/i);
+                        if (match) return { turn: Number(match[1]), brief: match[2].trim() };
+                        return { turn: idx + 1, brief: line };
+                    });
+                const latestSummary = (overlay.querySelector(".nS-val[data-idx='"+i+"']")?.value || '').trim();
                 storyline.summaries = Array.isArray(storyline.summaries) ? storyline.summaries : [];
                 if (latestSummary) {
                     const upToTurn = MemoryEngine.getCurrentTurn();
@@ -6370,11 +9477,14 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                     if (last) {
                         last.summary = latestSummary;
                         last.upToTurn = upToTurn;
+                        last.keyPoints = [...storyline.keyPoints];
+                        last.ongoingTensions = [...storyline.ongoingTensions];
                     } else {
-                        storyline.summaries.push({ upToTurn, summary: latestSummary, keyPoints: [...storyline.keyPoints], timestamp: Date.now() });
+                        storyline.summaries.push({ upToTurn, summary: latestSummary, keyPoints: [...storyline.keyPoints], ongoingTensions: [...storyline.ongoingTensions], timestamp: Date.now() });
                     }
                 }
                 _NAR.storylines[i] = storyline;
+                renderNarrative();
                 toast("✅ 내러티브 수정됨");
             } else if (target.classList.contains('act-del-nar')) {
                 const i = parseInt(target.dataset.idx, 10);
@@ -6409,6 +9519,11 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             await ColdStartManager.startAutoSummarization();
         };
 
+        overlay.querySelector('#btn-cold-reanalyze').onclick = async () => {
+            if (!confirm("현재 구축된 데이터와 새 재분석 결과를 원문 대화 기준으로 대조한 뒤, 더 적절한 구조 데이터로 재구축하시겠습니까?")) return;
+            await ColdStartManager.reanalyzeHistoricalConversation();
+        };
+
         overlay.querySelector('#btn-add-narrative').onclick = () => {
             _NAR.storylines = Array.isArray(_NAR.storylines) ? _NAR.storylines : [];
             _NAR.storylines.push({
@@ -6419,6 +9534,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 recentEvents: [],
                 summaries: [],
                 keyPoints: [],
+                ongoingTensions: [],
                 currentContext: ''
             });
             renderNarrative();
