@@ -22,6 +22,29 @@
         if (!chat) return [];
         return chat.msgs || chat.messages || chat.message || chat.log || chat.mes || chat.chat || [];
     };
+
+    const isLightBoardActive = async (preferredChat = null) => {
+        try {
+            if (typeof risuai === 'undefined') return false;
+            const char = await risuai.getCharacter();
+            if (!char) return false;
+            const chats = Array.isArray(char.chats) ? char.chats : [];
+            let chat = char.chats?.[char.chatPage];
+            if (preferredChat?.id) {
+                const matched = chats.find(entry => String(entry?.id || '') === String(preferredChat.id));
+                if (matched) chat = matched;
+            }
+            if (!chat) return false;
+            const msgs = getChatMessages(chat).slice(-3);
+            return msgs.some(m => {
+                const text = String(m?.content || '');
+                return (/\[LBDATA START\].*(lb-rerolling|lb-pending|lb-interaction-identifier)/is.test(text) || 
+                        /<lb-xnai-editing/is.test(text));
+            });
+        } catch (e) {
+            return false;
+        }
+    };
     const getComparableMessageText = (msg) => {
         const roleHint = (msg?.role === 'user' || msg?.is_user) ? 'user' : 'ai';
         return Utils.getNarrativeComparableText(Utils.getMessageText(msg), roleHint);
@@ -77,8 +100,25 @@
             .filter(Boolean);
         return stableHash(msgs.join('||'));
     };
+    const getOrCreatePendingChatScopeNonce = (chat) => {
+        if (!chat || typeof chat !== 'object') return `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const existing = String(chat.__libraRuntimeScopeNonce || '').trim();
+        if (existing) return existing;
+        const created = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        try {
+            Object.defineProperty(chat, '__libraRuntimeScopeNonce', {
+                value: created,
+                writable: true,
+                configurable: true,
+                enumerable: false
+            });
+        } catch {
+            chat.__libraRuntimeScopeNonce = created;
+        }
+        return created;
+    };
     const getChatRuntimeScopeKey = (chat, char = null) => {
-        const chatId = String(chat?.id || '__global__');
+        const chatId = String(chat?.id || getOrCreatePendingChatScopeNonce(chat));
         const charId = String(char?.id || char?.chaId || '');
         const page = String(char?.chatPage ?? chat?.chatPage ?? '');
         const sectionHints = collectSectionScopeHints(chat).join('|');
@@ -147,7 +187,7 @@
             .filter(Boolean);
     }
     const isStructuralWorldScalar = (text) => /^(normal|low|high|linear|nonlinear|non-linear|three_dimensional|two_dimensional|four_dimensional)$/i.test(String(text || '').trim());
-    const normalizeWorldCustomRules = (custom) => {
+    function normalizeWorldCustomRules(custom) {
         if (Array.isArray(custom)) {
             return Object.fromEntries(
                 custom
@@ -172,15 +212,78 @@
             );
         }
         return {};
-    };
-    const inferWorldClassificationLabel = (world = {}, sourceText = '') => {
+    }
+    function inferWorldClassificationLabel(world = {}, sourceText = '') {
         try {
             if (typeof EntityAwareProcessor !== 'undefined' && typeof EntityAwareProcessor?.inferWorldClassificationLabel === 'function') {
                 return EntityAwareProcessor.inferWorldClassificationLabel(world, sourceText);
             }
         } catch {}
         return String(world?.classification?.primary || '').trim();
-    };
+    }
+    function resolveWorldTemplateKey(classificationLabel, world = {}) {
+        const label = String(classificationLabel || '').trim();
+        if (WORLD_TEMPLATES[label]?.rules) return label;
+        if (label.includes('현대') && label.includes('판타지')) return 'modern_fantasy';
+        if (label.includes('로맨스 판타지')) return 'fantasy';
+        if (label.includes('게임') || label.includes('이세계')) return 'game_isekai';
+        if (label.includes('헌터')) return 'modern_fantasy';
+        if (label.includes('아카데미')) return (String(world?.exists?.technology || '').toLowerCase().includes('modern') ? 'modern_reality' : 'fantasy');
+        if (label.includes('대체역사')) return 'modern_reality';
+        if (label.includes('미스터리')) return 'modern_reality';
+        if (label.includes('호러')) return (world?.exists?.supernatural ? 'modern_fantasy' : 'modern_reality');
+        if (label.includes('초능력')) return 'modern_fantasy';
+        if (label.includes('선협')) return 'wuxia';
+        if (label.includes('무협')) return 'wuxia';
+        if (label.includes('사이버')) return 'cyberpunk';
+        if (label.includes('포스트')) return 'post_apocalyptic';
+        if (label === 'SF') return 'sf';
+        if (label === '판타지') return 'fantasy';
+        if (label === '현대') return 'modern_reality';
+
+        const exists = (world?.exists && typeof world.exists === 'object') ? world.exists : {};
+        const systems = (world?.systems && typeof world.systems === 'object') ? world.systems : {};
+        const technology = String(exists.technology || '').trim().toLowerCase();
+        if (systems.leveling || systems.stats || systems.classes) return 'game_isekai';
+        if (exists.ki) return 'wuxia';
+        if ((exists.magic || exists.supernatural) && technology.includes('modern')) return 'modern_fantasy';
+        if (technology.includes('future') || technology.includes('futur') || technology.includes('sci') || technology.includes('space')) {
+            return (systems.skills || systems.stats) ? 'cyberpunk' : 'sf';
+        }
+        if (exists.magic || exists.supernatural) return 'fantasy';
+        return 'modern_reality';
+    }
+    function normalizeWorldRuleUpdate(world) {
+        const normalized = {};
+        const sourceText = String(world?.__genreSourceText || '').trim();
+        const classificationLabel = inferWorldClassificationLabel(world, sourceText);
+        if (world && world.classification && typeof world.classification === 'object') {
+            world.classification.primary = classificationLabel;
+        }
+        const templateKey = resolveWorldTemplateKey(classificationLabel, world);
+        if (templateKey && WORLD_TEMPLATES[templateKey]?.rules) {
+            Object.assign(normalized, safeClone(WORLD_TEMPLATES[templateKey].rules));
+        }
+        for (const key of ['exists', 'systems', 'physics', 'custom']) {
+            if (key === 'custom') {
+                const normalizedCustom = normalizeWorldCustomRules(world?.custom);
+                if (Object.keys(normalizedCustom).length > 0) {
+                    normalized.custom = {
+                        ...(normalized.custom || {}),
+                        ...normalizedCustom
+                    };
+                }
+                continue;
+            }
+            if (world?.[key] && typeof world[key] === 'object' && !Array.isArray(world[key])) {
+                normalized[key] = {
+                    ...(normalized[key] || {}),
+                    ...world[key]
+                };
+            }
+        }
+        return normalized;
+    }
     const REVIEW_EXCERPT_MAX_CHARS = 5000;
     const truncateForLLM = (value, maxChars, marker = '\n...[TRUNCATED]...\n') => {
         const text = String(value || '');
@@ -515,41 +618,64 @@
         if (typeof document === 'undefined') return null;
         return { mode: 'body', host: document.body };
     };
+    const LIGHTBOARD_PERSIST_DELAY_MS = 3000;
+    const LIGHTBOARD_PERSIST_MAX_RETRIES = 5;
     const persistLoreToActiveChat = async (preferredChat, lore, opts = {}) => {
         if (!Array.isArray(lore)) return { ok: false, reason: 'invalid_lore' };
         const { saveCheckpoint = false, globalLore = undefined } = opts;
+        
+        let lbRetryCount = 0;
+        while (await isLightBoardActive(preferredChat) && lbRetryCount < LIGHTBOARD_PERSIST_MAX_RETRIES) {
+            lbRetryCount++;
+            if (MemoryEngine.CONFIG?.debug) {
+                console.log(`[LIBRA] persistLore delayed: LightBoard active (${lbRetryCount}/${LIGHTBOARD_PERSIST_MAX_RETRIES})`);
+            }
+            await sleep(LIGHTBOARD_PERSIST_DELAY_MS);
+        }
+        if (lbRetryCount >= LIGHTBOARD_PERSIST_MAX_RETRIES && await isLightBoardActive(preferredChat)) {
+            console.warn('[LIBRA] persistLore proceeding despite lingering LightBoard activity after grace period');
+        }
+
         bindUiInteractionGuards();
         const delayMs = uiInteractionHotUntil - Date.now();
         if (delayMs > 0) {
             await sleep(delayMs + 50);
         }
-        const ctx = await resolveActiveChatContext(preferredChat);
-        if (!ctx.char || !ctx.chat || ctx.charIdx < 0 || ctx.chatIndex < 0) {
+
+        const freshChar = await risuai.getCharacter();
+        if (!freshChar) return { ok: false, reason: 'missing_char' };
+        const charIdx = typeof risuai.getCurrentCharacterIndex === 'function' ? await risuai.getCurrentCharacterIndex() : -1;
+        const chats = Array.isArray(freshChar.chats) ? freshChar.chats : [];
+        let chatIndex = typeof risuai.getCurrentChatIndex === 'function' ? await risuai.getCurrentChatIndex() : -1;
+        if (preferredChat?.id) {
+            const resolved = chats.findIndex(entry => String(entry?.id || '') === String(preferredChat.id));
+            if (resolved >= 0) chatIndex = resolved;
+        }
+        const freshChat = chats[chatIndex];
+        if (!freshChat || charIdx < 0 || chatIndex < 0) {
             return { ok: false, reason: 'missing_chat_context' };
         }
 
-        const nextChat = cloneForMutation(ctx.chat);
-        nextChat.localLore = lore.map(entry => safeClone(entry));
+        const nextChat = cloneForMutation(freshChat);
+        const externalLore = (nextChat.localLore || []).filter(e => !e.comment || !String(e.comment).startsWith('lmai_'));
+        const libraLore = lore.filter(e => e.comment && String(e.comment).startsWith('lmai_')).map(e => safeClone(e));
+        nextChat.localLore = [...externalLore, ...libraLore];
 
+        const nextChar = cloneForMutation(freshChar);
         if (Array.isArray(globalLore)) {
-            const nextChar = cloneForMutation(ctx.char);
-            nextChar.lorebook = globalLore.map(entry => safeClone(entry));
-            nextChar.chats = Array.isArray(nextChar.chats) ? nextChar.chats : [];
-            nextChar.chats[ctx.chatIndex] = nextChat;
-            await risuai.setCharacter(nextChar);
-        } else if (typeof risuai.setChatToIndex === 'function') {
-            await risuai.setChatToIndex(ctx.charIdx, ctx.chatIndex, nextChat);
-        } else {
-            const nextChar = cloneForMutation(ctx.char);
-            nextChar.chats = Array.isArray(nextChar.chats) ? nextChar.chats : [];
-            nextChar.chats[ctx.chatIndex] = nextChat;
-            await risuai.setCharacter(nextChar);
+            const externalGlobal = (nextChar.lorebook || []).filter(e => !e.comment || !String(e.comment).startsWith('lmai_'));
+            const libraGlobal = globalLore.filter(e => e.comment && String(e.comment).startsWith('lmai_')).map(e => safeClone(e));
+            nextChar.lorebook = [...externalGlobal, ...libraGlobal];
         }
+        
+        nextChar.chats = Array.isArray(nextChar.chats) ? nextChar.chats : [];
+        nextChar.chats[chatIndex] = nextChat;
+        await risuai.setCharacter(nextChar);
 
         if (saveCheckpoint) {
-            await RefreshCheckpointManager.saveCheckpoint(ctx.char, nextChat, lore);
+            await RefreshCheckpointManager.saveCheckpoint(nextChar, nextChat, lore);
         }
-        return { ok: true, chat: nextChat, chatIndex: ctx.chatIndex, charIdx: ctx.charIdx };
+        return { ok: true, chat: nextChat, chatIndex: chatIndex, charIdx: charIdx };
     };
 
     // ══════════════════════════════════════════════════════════════
@@ -1675,6 +1801,7 @@
 
 [엄격 출력 규칙 / Strict Output Rules]
 - 응답은 JSON 객체 또는 JSON 배열 하나만 반환하십시오.
+- 절대로 사용자의 입력 내용을 그대로 반복하거나 출력에 포함하지 마십시오. NEVER echo, repeat, or include the user's input text in your output.
 - 첫 글자는 반드시 { 또는 [ 이어야 합니다.
 - 마지막 글자는 반드시 } 또는 ] 이어야 합니다.
 - 코드블록, Markdown, 설명문, 인사말, 주석, 사고흐름, reasoning, analysis, note, explanation, prefix/suffix를 절대 출력하지 마십시오.
@@ -2759,7 +2886,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                     ...((sanitized?.narrativeDetails?.storylines || []).flatMap(storyline => Array.isArray(storyline?.entities) ? storyline.entities : []))
                 ]).slice(0, 8);
                 const memoryHints = compactTextArray(sanitized?.world?.rules, 4, 140);
-                const loreHints = compactTextArray((sanitized?.narrativeDetails?.storylines || []).flatMap(storyline => Array.isArray(storyline?.keyPoints) ? storyline.keyPoints : []), 4, 140);
+                const loreHints = compactTextArray((sanitized?.narrativeDetails?.storylines || []).flatMap(storyline => Array.isArray(storyline?.keyPoints) ? storyline.keyPoints : []), 8, 140);
                 return await SectionWorldInferenceManager.inferPrompt(MemoryEngine.CONFIG, {
                     turn: MemoryEngine.getCurrentTurn?.() || 0,
                     userMsg: String(opts?.sourceLabel || opts?.worldNote || 'Imported knowledge').trim(),
@@ -3209,6 +3336,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 if (chat) chat.localLore = lore;
                 else char.lorebook = lore;
                 await persistLoreToActiveChat(chat, lore);
+                enterRefreshRecoveryWindow();
             } finally {
                 loreLock.writeUnlock();
             }
@@ -3571,9 +3699,11 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                     worldNote: 'Merged via Reanalysis Verification'
                 });
                 LMAI_GUI.toast("♻️ 과거 대화 재분석 누적 병합 및 검증 완료");
+                return verifiedMergedData;
             } catch (e) {
                 console.error("[LIBRA] Reanalysis Error:", e);
                 LMAI_GUI.toast(`❌ 재분석 실패: ${e.message || e}`);
+                throw e;
             } finally {
                 isProcessing = false;
             }
@@ -3652,10 +3782,12 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                     });
                 }
                 await applyFinalData(finalData);
+                return finalData;
 
             } catch (e) {
                 console.error("[LIBRA] Cold Start Error:", e);
                 LMAI_GUI.toast(`❌ 분석 실패: ${e.message || e}`);
+                throw e;
             } finally {
                 isProcessing = false;
             }
@@ -3693,7 +3825,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
 
         const _libraComments = [
             "lmai_world_graph", "lmai_world_node", "lmai_entity",
-            "lmai_relation", "lmai_narrative", "lmai_story_author", "lmai_char_states",
+            "lmai_relation", "lmai_narrative", "lmai_story_author", "lmai_director", "lmai_char_states",
             "lmai_world_states", "lmai_memory"
         ];
         const _libraInheritedComments = [
@@ -3894,7 +4026,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
 
                 const libraComments = [
                     "lmai_world_graph", "lmai_world_node", "lmai_entity", 
-                    "lmai_relation", "lmai_narrative", "lmai_story_author", "lmai_char_states", 
+                    "lmai_relation", "lmai_narrative", "lmai_story_author", "lmai_director", "lmai_char_states", 
                     "lmai_world_states", "lmai_user", "lmai_hypa_v3_source", "hypa_v3_import"
                 ];
                 
@@ -5301,19 +5433,28 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             this._checkKey(config.llm.key);
             const baseUrl = String(config.llm.url || '').trim().replace(/\/$/, '');
             this._checkUrl(baseUrl);
-            const modelPath = `/models/${config.llm.model}:generateContent`;
+            const model = String(config.llm.model || '').trim();
+            const modelPath = `/models/${model}:generateContent`;
             const url = baseUrl.includes(':generateContent') ? baseUrl : `${baseUrl}${modelPath}`;
+            const isThinkingModel = /gemini-(3|2\.5)/i.test(model);
+            const requestedTokens = options.maxTokens || 1000;
+            const maxOutputTokens = isThinkingModel ? Math.max(requestedTokens, 20000) : requestedTokens;
             const body = {
                 contents: [{ role: "user", parts: [{ text: userContent }] }],
                 generationConfig: {
                     temperature: config.llm.temp || 0.3,
-                    maxOutputTokens: options.maxTokens || 1000
+                    maxOutputTokens: maxOutputTokens
                 }
             };
             if (systemPrompt) {
                 body.systemInstruction = { parts: [{ text: systemPrompt }] };
             }
-            if ((config.llm.reasoningBudgetTokens || 0) > 0) {
+            if (isThinkingModel) {
+                body.generationConfig.thinkingConfig = { includeThoughts: false };
+                if ((config.llm.reasoningBudgetTokens || 0) > 0) {
+                    body.generationConfig.thinkingConfig.thinkingBudget = Math.max(0, parseInt(config.llm.reasoningBudgetTokens, 10) || 0);
+                }
+            } else if ((config.llm.reasoningBudgetTokens || 0) > 0) {
                 body.generationConfig.thinkingConfig = {
                     thinkingBudget: Math.max(0, parseInt(config.llm.reasoningBudgetTokens, 10) || 0)
                 };
@@ -9233,10 +9374,11 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             isStandardLoreActive,
             prefilterStandardLore,
             setLorebook: (char, chat, data) => {
-                if (Array.isArray(chat?.localLore)) chat.localLore = data;
-                else if (Array.isArray(char?.lorebook)) char.lorebook = data;
-                else if (chat) chat.localLore = data;
-                else if (char) char.lorebook = data;
+                const next = Array.isArray(data) ? data.map(e => safeClone(e)) : [];
+                if (Array.isArray(chat?.localLore)) chat.localLore = next;
+                else if (Array.isArray(char?.lorebook)) char.lorebook = next;
+                else if (chat) chat.localLore = next;
+                else if (char) char.lorebook = next;
             },
             getManagedEntries: (lorebook) => (Array.isArray(lorebook) ? lorebook : []).filter(e => e.comment === 'lmai_memory'),
             getLastRetrievalDebug: () => lastRetrievalDebug ? safeClone(lastRetrievalDebug) : null,
@@ -9720,6 +9862,7 @@ Extract the following information from the conversation and output in JSON forma
 
 [엄격 출력 규칙 / Strict Output Rules]
 - 응답은 JSON 객체 하나만 반환하십시오.
+- 절대로 사용자의 입력 내용을 그대로 반복하거나 출력에 포함하지 마십시오. NEVER echo, repeat, or include the user's input text in your output.
 - 첫 글자는 반드시 { 이어야 하고, 마지막 글자는 반드시 } 이어야 합니다.
 - 코드블록, Markdown, 설명문, 주석, 사고흐름, reasoning, analysis, note, apology, prefix/suffix를 절대 출력하지 마십시오.
 - JSON 앞뒤에 어떤 문자도 붙이지 마십시오.
@@ -9738,6 +9881,7 @@ You audit freshly extracted turn state and correct only clear mistakes.
 - 이름은 반드시 기존 표기 그대로 사용하십시오.
 - 수정이 필요 없으면 correctedEntities / correctedRelations / world / narrative 를 비워 두십시오.
 - 모든 설명 필드는 영문으로 작성하십시오.
+- 절대로 사용자의 입력 내용을 그대로 반복하거나 출력에 포함하지 마십시오. NEVER echo, repeat, or include the user's input text in your output.
 
 [출력 JSON 스키마 / Output JSON Schema]
 {
@@ -10594,6 +10738,27 @@ if (typeof risuai !== 'undefined') {
     risuai.addRisuReplacer('beforeRequest', async (messages, type) => {
         // 메시지 배열 유효성 검증
         const safeMessages = (Array.isArray(messages) ? messages : []).filter(m => m && typeof m === 'object' && m.role);
+        
+        // Task 2-1: Skip if LightBoard/XNAI messages are found
+        const shouldSkipLBXNAI = (msgs) => {
+            const recentMsgs = Array.isArray(msgs) ? msgs.slice(-2) : [];
+            return recentMsgs.some(m => {
+                const text = String(m?.content || '');
+                return (
+                    (/\[LBDATA START\].*lb-rerolling/is.test(text)) ||
+                    (/\[LBDATA START\].*lb-interaction-identifier/is.test(text)) ||
+                    (/\[LBDATA START\].*lb-pending/is.test(text)) ||
+                    (/<lb-xnai-editing/is.test(text)) ||
+                    (/lb-xnai-gen\//is.test(text))
+                );
+            });
+        };
+
+        if (shouldSkipLBXNAI(safeMessages)) {
+            if (MemoryEngine.CONFIG?.debug) console.log('[LIBRA] beforeRequest skipped: LightBoard/XNAI pattern detected');
+            return safeMessages;
+        }
+
         try {
             if (!Utils.isNarrativeRequestType(type)) {
                 if (MemoryEngine.CONFIG?.debug) {
@@ -10751,7 +10916,7 @@ if (typeof risuai !== 'undefined') {
                 
                 if (standardLore.length > 0) {
                     const loreResults = await MemoryEngine.retrieveMemories(
-                        userMessage, MemoryEngine.getCurrentTurn(), standardLore, {}, 3
+                        userMessage, MemoryEngine.getCurrentTurn(), standardLore, {}, 8
                     );
                     if (loreResults.length > 0) {
                         lorebookText = loreResults.map((m, i) => `[참고 설정 ${i+1}] ${m.content.replace(MemoryEngine.META_PATTERN, '').slice(0, 400)}`).join('\n');
@@ -10773,7 +10938,7 @@ if (typeof risuai !== 'undefined') {
                 storyAuthorPrompt,
                 focusCharacters: mentionedEntities.map(entity => entity.name).filter(Boolean).slice(0, 6),
                 memoryHints: memories.slice(0, 4).map(item => Utils.getMemorySourceText((item.content || '').replace(MemoryEngine.META_PATTERN, '')).slice(0, 120)),
-                loreHints: lorebookText ? lorebookText.split('\n').map(line => line.trim()).filter(Boolean).slice(0, 3) : []
+                loreHints: lorebookText ? lorebookText.split('\n').map(line => line.trim()).filter(Boolean).slice(0, 8) : []
             });
             const sectionWorldMeta = SectionWorldInferenceManager.getLastMeta();
             const resolveNarrativeInjectionPriority = () => {
@@ -10998,6 +11163,25 @@ if (typeof risuai !== 'undefined') {
 
     // afterRequest: 기억 저장 및 엔티티 업데이트
     risuai.addRisuReplacer('afterRequest', async (content, type) => {
+        // Task 2-2: Skip ONLY if it's a pure internal control/maintenance response
+        const shouldSkipAfterLBXNAI = (text) => {
+            const raw = String(text || '');
+            // Check for explicit control/background markers
+            const isControlResponse = (
+                (/\[LBDATA START\].*(lb-rerolling|lb-interaction-identifier|lb-pending)/is.test(raw)) ||
+                (/<lb-process>/is.test(raw)) ||
+                (/lb-xnai-editing/is.test(raw))
+            );
+            // Illustration tags (<lb-xnai>) and NPC lists (<npc-list>) do NOT trigger a skip 
+            // because they are often part of a standard narrative turn.
+            return isControlResponse;
+        };
+
+        if (shouldSkipAfterLBXNAI(content)) {
+            if (MemoryEngine.CONFIG?.debug) console.log('[LIBRA] afterRequest skipped: LightBoard/XNAI pattern detected');
+            return content;
+        }
+
         try {
             if (!Utils.isNarrativeRequestType(type)) {
                 if (MemoryEngine.CONFIG?.debug) {
@@ -11600,7 +11784,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
       <button class="btn" id="btn-export-settings-file">📤 설정 내보내기</button>
       <button class="btn" id="btn-import-settings-file">📥 설정 가져오기</button>
       <button class="btn bp" id="btn-save-settings">💾 설정 저장</button>
-      <button class="btn bd" id="btn-reset-settings">🔄 초기화</button>
+      <button class="btn bd" id="btn-reset-settings">🔄 설정 초기화</button>
+      <button class="btn bd" id="lmai-cache-reset">🔄 캐시 초기화</button>
     </div>
   </div>
 </div>
@@ -11688,6 +11873,19 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         const parseMeta = (c) => { var m=(c||"").match(/\[META:(\{.*?\})\]/); if(!m)return{imp:5,t:0,ttl:0,cat:""}; try{return JSON.parse(m[1]);}catch(e){return{imp:5,t:0,ttl:0,cat:""};} };
         const stripMeta = (c) => (c||"").replace(/\[META:\{.*?\}\]/g,"").trim();
         const impBdg = (i) => { const cls = i>=7?"bh":i>=4?"bm":"bl"; return `<span class="bdg ${cls}">중요도 ${i}</span>`; };
+        const GUI_PARTIAL_MANAGED_COMMENTS = new Set(['lmai_memory', 'lmai_entity', 'lmai_relation', 'lmai_world_graph', 'lmai_world_node']);
+        const buildFullManagedLoreSnapshot = (partialLore) => {
+            const baseLore = Array.isArray(lore) ? lore : [];
+            const preserved = baseLore
+                .filter(entry => {
+                    const comment = String(entry?.comment || '');
+                    if (!comment.startsWith('lmai_')) return true;
+                    return !GUI_PARTIAL_MANAGED_COMMENTS.has(comment);
+                })
+                .map(entry => safeClone(entry));
+            const additions = (Array.isArray(partialLore) ? partialLore : []).map(entry => safeClone(entry));
+            return [...preserved, ...additions];
+        };
         
         const saveLoreToChar = async (newLore, cb) => {
             if (!char) return;
@@ -11697,8 +11895,12 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 if (targetChat && Array.isArray(targetChat.localLore)) targetChat.localLore = newLore;
                 else if (Array.isArray(char.lorebook)) char.lorebook = newLore;
                 else if (targetChat) targetChat.localLore = newLore;
-                await persistLoreToActiveChat(targetChat, newLore);
-                lore = Array.isArray(newLore) ? [...newLore] : [];
+                const persistResult = await persistLoreToActiveChat(targetChat, newLore);
+                const persistedLore = Array.isArray(persistResult?.chat?.localLore)
+                    ? persistResult.chat.localLore.map(entry => safeClone(entry))
+                    : (Array.isArray(newLore) ? newLore.map(entry => safeClone(entry)) : []);
+                lore = persistedLore;
+                if (targetChat) targetChat.localLore = persistedLore.map(entry => safeClone(entry));
                 MemoryEngine.rebuildIndex(lore);
                 HierarchicalWorldManager.loadWorldGraph(lore);
                 EntityManager.rebuildCache(lore);
@@ -11837,8 +12039,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         const addManualUserLorebook = async () => {
             const payload = await promptManualLorebookText();
             if (!payload?.text) return;
-            const activeChat = char?.chats?.[char.chatPage];
-            if (!char || !activeChat) throw new Error("채팅방을 찾을 수 없습니다.");
+            if (!char || !chat) throw new Error("채팅방을 찾을 수 없습니다.");
 
             LIBRAActivityDashboard.beginRequest({
                 title: '수동 로어북 병합',
@@ -11880,7 +12081,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                     }
                 );
 
-                lore = MemoryEngine.getLorebook(char, activeChat) || lore;
+                lore = MemoryEngine.getLorebook(char, chat) || lore;
                 syncGuiSnapshotsFromRuntime();
                 renderEnts();
                 renderNarrative();
@@ -11912,14 +12113,12 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         };
         const persistWorldGraphFromGui = async (successMessage = '', renderAfterSave = true) => {
             if (!_WLD) return false;
-            const guiManaged = new Set(['lmai_memory', 'lmai_entity', 'lmai_relation', 'lmai_world_graph', 'lmai_world_node']);
-            const preserved = lore.filter(e => !guiManaged.has(e.comment));
-            let newLore = [...preserved];
+            let newLore = [];
             newLore.unshift({ key: LibraLoreKeys.worldGraph(), comment: "lmai_world_graph", content: JSON.stringify(_WLD), mode: "normal", insertorder: 1, alwaysActive: false });
             _ENT.forEach(e => newLore.push(e));
             _REL.forEach(r => newLore.push(r));
             _MEM.forEach(m => newLore.push(m));
-            await saveLoreToChar(newLore, () => {
+            await saveLoreToChar(buildFullManagedLoreSnapshot(newLore), () => {
                 if (renderAfterSave) renderWorld();
                 if (successMessage) toast(successMessage);
             });
@@ -12018,6 +12217,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 activeTask: '세계관 재분석'
             });
             await persistWorldGraphFromGui("🔄 세계관 재분석 완료", true);
+            lore = MemoryEngine.getLorebook(char, activeChat) || lore;
+            syncGuiSnapshotsFromRuntime();
         };
         const buildReplayableTurnPairs = (msgs) => {
             const pairs = [];
@@ -12260,48 +12461,57 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             const entityCacheValues = Array.from(EntityManager.getEntityCache().values());
             const currentTurn = Math.max(1, Number(MemoryEngine.getCurrentTurn() || turnPairs.length));
             const baseTurn = Math.max(1, currentTurn - turnPairs.length + 1);
-            NarrativeTracker.resetState({ storylines: [], turnLog: [], lastSummaryTurn: 0 });
+            const previousNarrativeState = safeClone(NarrativeTracker.getState?.() || { storylines: [], turnLog: [], lastSummaryTurn: 0 });
 
-            for (let i = 0; i < turnPairs.length; i++) {
-                const pair = turnPairs[i];
-                const combinedText = `${pair.userText || ''}\n${pair.aiText || ''}`;
-                const involvedEntities = entityCacheValues
-                    .filter(entity => EntityManager.mentionsEntity(combinedText, entity))
-                    .map(entity => entity.name);
-                await NarrativeTracker.recordTurn(
-                    baseTurn + i,
-                    pair.userText || '',
-                    pair.aiText || '',
-                    involvedEntities,
-                    MemoryEngine.CONFIG
-                );
-                if ((i + 1) % 3 === 0 || i === turnPairs.length - 1) {
-                    LIBRAActivityDashboard.setStage(`스토리라인 턴을 재적용하는 중 (${i + 1}/${turnPairs.length})`, Math.min(78, 34 + Math.round(((i + 1) / Math.max(1, turnPairs.length)) * 42)), {
-                        status: 'reanalyzing-narrative',
-                        activeTask: '내러티브 재분석'
-                    });
-                }
-            }
-            LIBRAActivityDashboard.setStage('스토리라인 요약을 다시 계산하는 중', 84, {
-                status: 'reanalyzing-narrative',
-                activeTask: '내러티브 재분석'
-            });
-            await NarrativeTracker.summarizeIfNeeded(baseTurn + turnPairs.length, MemoryEngine.CONFIG);
-
-            await loreLock.writeLock();
             try {
-                LIBRAActivityDashboard.setStage('내러티브 상태를 저장하는 중', 92, {
+                NarrativeTracker.resetState({ storylines: [], turnLog: [], lastSummaryTurn: 0 });
+
+                for (let i = 0; i < turnPairs.length; i++) {
+                    const pair = turnPairs[i];
+                    const combinedText = `${pair.userText || ''}\n${pair.aiText || ''}`;
+                    const involvedEntities = entityCacheValues
+                        .filter(entity => EntityManager.mentionsEntity(combinedText, entity))
+                        .map(entity => entity.name);
+                    await NarrativeTracker.recordTurn(
+                        baseTurn + i,
+                        pair.userText || '',
+                        pair.aiText || '',
+                        involvedEntities,
+                        MemoryEngine.CONFIG
+                    );
+                    if ((i + 1) % 3 === 0 || i === turnPairs.length - 1) {
+                        LIBRAActivityDashboard.setStage(`스토리라인 턴을 재적용하는 중 (${i + 1}/${turnPairs.length})`, Math.min(78, 34 + Math.round(((i + 1) / Math.max(1, turnPairs.length)) * 42)), {
+                            status: 'reanalyzing-narrative',
+                            activeTask: '내러티브 재분석'
+                        });
+                    }
+                }
+
+                LIBRAActivityDashboard.setStage('스토리라인 요약을 다시 계산하는 중', 84, {
                     status: 'reanalyzing-narrative',
                     activeTask: '내러티브 재분석'
                 });
-                await NarrativeTracker.saveState(lore);
-                MemoryEngine.setLorebook(char, activeChat, lore);
-                await persistLoreToActiveChat(activeChat, lore, { saveCheckpoint: true });
-            } finally {
-                loreLock.writeUnlock();
+                await NarrativeTracker.summarizeIfNeeded(baseTurn + turnPairs.length, MemoryEngine.CONFIG);
+
+                await loreLock.writeLock();
+                try {
+                    LIBRAActivityDashboard.setStage('내러티브 상태를 저장하는 중', 92, {
+                        status: 'reanalyzing-narrative',
+                        activeTask: '내러티브 재분석'
+                    });
+                    await NarrativeTracker.saveState(lore);
+                    MemoryEngine.setLorebook(char, activeChat, lore);
+                    await persistLoreToActiveChat(activeChat, lore, { saveCheckpoint: true });
+                } finally {
+                    loreLock.writeUnlock();
+                }
+                syncGuiSnapshotsFromRuntime();
+                renderNarrative();
+            } catch (e) {
+                NarrativeTracker.resetState(previousNarrativeState);
+                _NAR = safeClone(previousNarrativeState);
+                throw e;
             }
-            syncGuiSnapshotsFromRuntime();
-            renderNarrative();
         };
 
         const getHypaScopeId = (targetChar) => {
@@ -12425,11 +12635,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         }));
 
         const importHypaV3ToLorebook = async () => {
-            if (!char) {
-                toast("❌ 캐릭터를 찾을 수 없습니다");
+            if (!char || !chat) {
+                toast("❌ 캐릭터 또는 채팅방을 찾을 수 없습니다");
                 return;
             }
-            const activeChat = char?.chats?.[char.chatPage];
 
             LIBRAActivityDashboard.beginRequest({
                 requestType: 'hypa-import',
@@ -12473,7 +12682,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 });
                 toast("🧠 하이파 V3 지식을 캐릭터/세계관에 반영 중...");
                 await ColdStartManager.integrateImportedKnowledge(payload.knowledgeTexts, 'Hypa V3');
-                lore = MemoryEngine.getLorebook(char, activeChat) || lore;
+                lore = MemoryEngine.getLorebook(char, chat) || lore;
                 syncGuiSnapshotsFromRuntime();
                 renderEnts();
                 renderNarrative();
@@ -12824,7 +13033,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         };
 
         const applyColdStartScopePresetToUI = (presetKey) => {
-            overlay.querySelector("#scsp").value = 'all';
+            overlay.querySelector("#scsp").value = presetKey || MemoryEngine.CONFIG.coldStartScopePreset || 'all';
         };
 
         const markMemoryPresetCustom = () => {
@@ -12847,7 +13056,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 recency: parseFloat(overlay.querySelector("#swr").value) || WEIGHT_MODE_PRESETS.auto.recency
             }, WEIGHT_MODE_PRESETS.auto);
 
-            const coldStartScopePreset = String(_CFG.coldStartScopePreset || 'all');
+            const coldStartScopePreset = String(overlay.querySelector("#scsp")?.value || _CFG.coldStartScopePreset || MemoryEngine.CONFIG.coldStartScopePreset || 'all');
             const storyAuthorMode = overlay.querySelector("#ssam").value || 'disabled';
             const directorMode = overlay.querySelector("#sdm").value || 'disabled';
             return {
@@ -12868,7 +13077,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 simThreshold: parseFloat(overlay.querySelector("#sst").value) || MEMORY_PRESETS.general.simThreshold,
                 gcBatchSize: parseInt(overlay.querySelector("#sgc").value) || MEMORY_PRESETS.general.gcBatchSize,
                 coldStartScopePreset,
-                coldStartHistoryLimit: resolveColdStartHistoryLimit(coldStartScopePreset, Number(_CFG.coldStartHistoryLimit || 0)),
+                coldStartHistoryLimit: resolveColdStartHistoryLimit(coldStartScopePreset, Number(_CFG.coldStartHistoryLimit || MemoryEngine.CONFIG.coldStartHistoryLimit || 0)),
                 weightMode: overlay.querySelector("#swm").value,
                 weights: resolveWeightsForMode(overlay.querySelector("#swm").value, customWeights),
                 worldAdjustmentMode: overlay.querySelector("#sam").value,
@@ -13112,16 +13321,12 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         };
 
         overlay.querySelector('#btn-save-all-mem').onclick = () => {
-            // LIBRA GUI가 직접 편집하는 타입 목록
-            const guiManaged = new Set(['lmai_memory', 'lmai_entity', 'lmai_relation', 'lmai_world_graph', 'lmai_world_node']);
-            // 비편집 엔트리 보존 (비-LIBRA 엔트리 + 트래커 엔트리)
-            const preserved = lore.filter(e => !guiManaged.has(e.comment));
-            let newLore = [...preserved];
+            let newLore = [];
             if (_WLD) newLore.unshift({ key: LibraLoreKeys.worldGraph(), comment: "lmai_world_graph", content: JSON.stringify(_WLD), mode: "normal", insertorder: 1, alwaysActive: false });
             _ENT.forEach(e => newLore.push(e));
             _REL.forEach(r => newLore.push(r));
             _MEM.forEach(m => newLore.push({ key: m.key || "", comment: "lmai_memory", content: m.content, mode: "normal", insertorder: 100, alwaysActive: false }));
-            saveLoreToChar(newLore, () => toast("💾 메모리 저장됨"));
+            saveLoreToChar(buildFullManagedLoreSnapshot(newLore), () => toast("💾 메모리 저장됨"));
         };
 
         // 엔티티 및 관계 액션
@@ -13201,14 +13406,12 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         };
 
         overlay.querySelector('#btn-save-ents').onclick = () => {
-            const guiManaged = new Set(['lmai_memory', 'lmai_entity', 'lmai_relation', 'lmai_world_graph', 'lmai_world_node']);
-            const preserved = lore.filter(e => !guiManaged.has(e.comment));
-            let newLore = [...preserved];
+            let newLore = [];
             if (_WLD) newLore.unshift({ key: LibraLoreKeys.worldGraph(), comment: "lmai_world_graph", content: JSON.stringify(_WLD), mode: "normal", insertorder: 1, alwaysActive: false });
             _ENT.forEach(e => newLore.push(e));
             _REL.forEach(r => newLore.push(r));
             _MEM.forEach(m => newLore.push(m));
-            saveLoreToChar(newLore, () => toast("💾 저장됨"));
+            saveLoreToChar(buildFullManagedLoreSnapshot(newLore), () => toast("💾 저장됨"));
         };
         overlay.querySelector('#btn-reanalyze-mem').onclick = async () => {
             try {
@@ -13296,6 +13499,35 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             if (!confirm("모든 설정을 초기값으로 되돌리시겠습니까?")) return;
             _CFG = { useLLM: true, cbsEnabled: true, useLorebookRAG: true, emotionEnabled: true, illustrationModuleCompatEnabled: false, nsfwEnabled: false, preventUserIgnoreEnabled: false, storyAuthorEnabled: true, storyAuthorMode: "proactive", directorEnabled: true, directorMode: "strong", sectionWorldInferenceEnabled: true, debug: false, memoryPreset: "general", maxLimit: MEMORY_PRESETS.general.maxLimit, threshold: MEMORY_PRESETS.general.threshold, simThreshold: MEMORY_PRESETS.general.simThreshold, gcBatchSize: MEMORY_PRESETS.general.gcBatchSize, coldStartScopePreset: "all", coldStartHistoryLimit: 0, weightMode: "auto", worldAdjustmentMode: "dynamic", llm: { provider: "openai", url: "", key: "", model: "gpt-4o-mini", temp: 0.3, timeout: 120000, reasoningEffort: "none", reasoningBudgetTokens: 0 }, auxLlm: { enabled: false, provider: "openai", url: "", key: "", model: "gpt-4o-mini", temp: 0.2, timeout: 90000, reasoningEffort: "none", reasoningBudgetTokens: 0 }, embed: { provider: "openai", url: "", key: "", model: "text-embedding-3-small", timeout: 120000 } };
             loadSettings(); toast("🔄 설정 초기화됨");
+        };
+
+        overlay.querySelector('#lmai-cache-reset').onclick = async () => {
+            if (!confirm("모든 런타임 데이터를 초기화하고 로어북에서 재동기화하시겠습니까?")) return;
+            
+            MemoryState.reset({ preserveSessionCache: false });
+            EntityManager.clearCache();
+            if (typeof EntityManager.getRelationCache === 'function' && EntityManager.getRelationCache().clear) {
+                EntityManager.getRelationCache().clear();
+            }
+            const activeChatId = chat?.id || null;
+            const activeScopeKey = getChatRuntimeScopeKey(chat, char);
+
+            lore = MemoryEngine.getLorebook(char, chat) || lore;
+            reloadChatScopedRuntime(lore, activeChatId, {
+                resetSessionCaches: true,
+                forceWorldReload: true,
+                scopeKey: activeScopeKey,
+                resetScopedState: false
+            });
+            MemoryState.currentSessionId = buildScopedSessionId(activeScopeKey);
+            
+            syncGuiSnapshotsFromRuntime();
+            renderEnts();
+            renderNarrative();
+            renderWorld();
+            filterMems();
+            
+            toast("✅ 캐시가 초기화되고 로어북 기준으로 동기화되었습니다.");
         };
 
         // 리스트 동적 버튼 이벤트 위임 (Event Delegation)
@@ -13477,24 +13709,54 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
 
         overlay.querySelector('#btn-cold-start').onclick = async () => {
             if (!confirm("현재 채팅방의 과거 내역을 분석하여 메모리를 재구축하시겠습니까?")) return;
-            await ColdStartManager.startAutoSummarization();
-            lore = MemoryEngine.getLorebook(char, chat) || lore;
-            syncGuiSnapshotsFromRuntime();
-            renderEnts();
-            renderNarrative();
-            renderWorld();
-            filterMems();
+            try {
+                LIBRAActivityDashboard.beginRequest({
+                    title: '과거 대화 분석',
+                    task: '현재 채팅의 과거 로그를 분석해 구조 데이터를 재구축하는 중'
+                });
+                LIBRAActivityDashboard.setStage('분석할 대화 로그를 준비하는 중', 14, {
+                    status: 'cold-start',
+                    activeTask: '과거 대화 분석'
+                });
+                await ColdStartManager.startAutoSummarization();
+                lore = MemoryEngine.getLorebook(char, chat) || lore;
+                syncGuiSnapshotsFromRuntime();
+                renderEnts();
+                renderNarrative();
+                renderWorld();
+                filterMems();
+                LIBRAActivityDashboard.complete('과거 대화 분석 완료');
+                toast("✅ 과거 대화 분석 완료");
+            } catch (e) {
+                LIBRAActivityDashboard.fail(`과거 대화 분석 실패: ${e?.message || e}`);
+                toast(`❌ 과거 대화 분석 실패: ${e?.message || e}`);
+            }
         };
 
         overlay.querySelector('#btn-cold-reanalyze').onclick = async () => {
             if (!confirm("현재 구축된 데이터와 새 재분석 결과를 원문 대화 기준으로 대조한 뒤, 더 적절한 구조 데이터로 재구축하시겠습니까?")) return;
-            await ColdStartManager.reanalyzeHistoricalConversation();
-            lore = MemoryEngine.getLorebook(char, chat) || lore;
-            syncGuiSnapshotsFromRuntime();
-            renderEnts();
-            renderNarrative();
-            renderWorld();
-            filterMems();
+            try {
+                LIBRAActivityDashboard.beginRequest({
+                    title: '과거 대화 재분석',
+                    task: '기존 구조 데이터와 원문 대화를 대조해 재검증하는 중'
+                });
+                LIBRAActivityDashboard.setStage('원문 대화와 기존 구조 데이터를 준비하는 중', 14, {
+                    status: 'cold-reanalyze',
+                    activeTask: '과거 대화 재분석'
+                });
+                await ColdStartManager.reanalyzeHistoricalConversation();
+                lore = MemoryEngine.getLorebook(char, chat) || lore;
+                syncGuiSnapshotsFromRuntime();
+                renderEnts();
+                renderNarrative();
+                renderWorld();
+                filterMems();
+                LIBRAActivityDashboard.complete('과거 대화 재분석 완료');
+                toast("✅ 과거 대화 재분석 완료");
+            } catch (e) {
+                LIBRAActivityDashboard.fail(`과거 대화 재분석 실패: ${e?.message || e}`);
+                toast(`❌ 과거 대화 재분석 실패: ${e?.message || e}`);
+            }
         };
 
         overlay.querySelector('#btn-add-narrative').onclick = () => {
@@ -13516,7 +13778,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
 
         overlay.querySelector('#btn-save-narrative').onclick = async () => {
             const narrativeEntry = buildNarrativeLoreEntry();
-            const nextLore = lore.filter(e => e.comment !== 'lmai_narrative');
+            const nextLore = lore.filter(e => e.comment !== 'lmai_narrative').map(entry => safeClone(entry));
             nextLore.push(narrativeEntry);
             await saveLoreToChar(nextLore, () => {
                 NarrativeTracker.loadState(nextLore);
