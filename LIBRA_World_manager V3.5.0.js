@@ -147,6 +147,40 @@
             .filter(Boolean);
     }
     const isStructuralWorldScalar = (text) => /^(normal|low|high|linear|nonlinear|non-linear|three_dimensional|two_dimensional|four_dimensional)$/i.test(String(text || '').trim());
+    const normalizeWorldCustomRules = (custom) => {
+        if (Array.isArray(custom)) {
+            return Object.fromEntries(
+                custom
+                    .map((value, index) => [`rule_${index + 1}`, String(value || '').trim()])
+                    .filter(([, value]) => value)
+            );
+        }
+        if (typeof custom === 'string') {
+            const trimmed = custom.trim();
+            return trimmed ? { rule_1: trimmed } : {};
+        }
+        if (custom && typeof custom === 'object') {
+            return Object.fromEntries(
+                Object.entries(custom)
+                    .map(([key, value]) => {
+                        if (value == null) return [String(key || '').trim(), ''];
+                        if (typeof value === 'string') return [String(key || '').trim(), value.trim()];
+                        if (typeof value === 'number' || typeof value === 'boolean') return [String(key || '').trim(), String(value)];
+                        return [String(key || '').trim(), JSON.stringify(value)];
+                    })
+                    .filter(([key, value]) => key && value)
+            );
+        }
+        return {};
+    };
+    const inferWorldClassificationLabel = (world = {}, sourceText = '') => {
+        try {
+            if (typeof EntityAwareProcessor !== 'undefined' && typeof EntityAwareProcessor?.inferWorldClassificationLabel === 'function') {
+                return EntityAwareProcessor.inferWorldClassificationLabel(world, sourceText);
+            }
+        } catch {}
+        return String(world?.classification?.primary || '').trim();
+    };
     const REVIEW_EXCERPT_MAX_CHARS = 5000;
     const truncateForLLM = (value, maxChars, marker = '\n...[TRUNCATED]...\n') => {
         const text = String(value || '');
@@ -373,6 +407,10 @@
         ].filter(Boolean).join('\n\n');
     };
     function resolveColdStartHistoryLimit(preset, fallbackLimit = 100) {
+        const normalizedPreset = String(preset || 'all').trim().toLowerCase();
+        const numericFallback = Number(fallbackLimit);
+        if (normalizedPreset === 'all') return 0;
+        if (Number.isFinite(numericFallback) && numericFallback > 0) return Math.max(1, Math.floor(numericFallback));
         return 0;
     }
     const markUiInteractionHot = () => {
@@ -3181,12 +3219,20 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 .map(v => String(v || '').trim())
                 .filter(Boolean);
             if (texts.length === 0) return null;
+            const updateSynthesisDashboard = (label, progress) => {
+                if (typeof LIBRAActivityDashboard === 'undefined') return;
+                LIBRAActivityDashboard.setStage(label, progress, {
+                    status: 'running',
+                    activeTask: '가져온 지식 구조화'
+                });
+            };
 
             const textChunks = [];
             const chunkSize = 8;
             for (let i = 0; i < texts.length; i += chunkSize) {
                 textChunks.push(texts.slice(i, i + chunkSize));
             }
+            updateSynthesisDashboard(`가져온 지식 ${textChunks.length}개 청크를 준비하는 중`, 54);
 
             const chunkPromises = textChunks.map((chunk, i) => {
                 const chunkText = chunk.map((text, idx) => `Knowledge ${idx + 1}: ${truncateForLLM(text, IMPORT_KNOWLEDGE_MAX_ITEM_CHARS, ' ...[TRUNCATED]... ')}`).join('\n\n');
@@ -3197,17 +3243,24 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             const chunkResults = await Promise.allSettled(chunkPromises);
 
             const chunkSummaries = [];
+            let settledChunkCount = 0;
             for (const result of chunkResults) {
+                settledChunkCount += 1;
                 if (result.status === 'fulfilled' && result.value.content) {
                     const parsed = extractStructuredJson(result.value.content);
                     if (parsed) chunkSummaries.push(parsed);
                 }
+                updateSynthesisDashboard(
+                    `가져온 지식을 구조화하는 중 (${settledChunkCount}/${Math.max(1, chunkResults.length)})`,
+                    54 + Math.round((settledChunkCount / Math.max(1, chunkResults.length)) * 14)
+                );
             }
             if (chunkSummaries.length === 0) return null;
 
             let finalData = null;
             for (let attempt = 0; attempt < 2 && !finalData; attempt++) {
                 try {
+                    updateSynthesisDashboard('구조화 결과를 최종 합성하는 중', 72 + (attempt * 4));
                     const synthesisInput = buildSynthesisInput(chunkSummaries);
                     const synthesisResult = await runMaintenanceLLM(() =>
                         LLMProvider.call(
@@ -3281,8 +3334,22 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
         const analyzeConversationMessages = async (msgs, taskLabel = 'cold-start') => {
             if (!Array.isArray(msgs) || msgs.length === 0) return null;
             const chunks = buildAnalysisMessageChunks(msgs, 25);
+            const isColdStartTask = String(taskLabel || '').startsWith('cold-start');
+            const isReanalysisTask = String(taskLabel || '').startsWith('cold-reanalysis');
+            const updateAnalysisDashboard = (label, progress, extras = {}) => {
+                if (typeof LIBRAActivityDashboard === 'undefined') return;
+                LIBRAActivityDashboard.setStage(label, progress, {
+                    status: 'running',
+                    activeTask: isReanalysisTask ? '과거 대화 재분석' : '과거 대화 분석',
+                    ...extras
+                });
+            };
 
             LMAI_GUI.toast(`총 ${chunks.length}개 청크 병렬 분석 시작...`);
+            updateAnalysisDashboard(
+                `대화 청크 ${chunks.length}개를 준비하는 중`,
+                isReanalysisTask ? 20 : 18
+            );
 
             const chunkPromises = chunks.map((chunk, i) => {
                 const chunkText = buildAnalysisChunkText(chunk);
@@ -3323,17 +3390,32 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             const chunkSummaries = [];
             let skippedChunkCount = 0;
             let failedChunkCount = 0;
+            const totalChunkCount = Math.max(1, chunkResults.length);
+            let settledChunkCount = 0;
             for (const result of chunkResults) {
+                settledChunkCount += 1;
                 if (result.status === 'fulfilled' && result.value?.skipped) {
                     skippedChunkCount++;
+                    updateAnalysisDashboard(
+                        `대화 청크를 분석하는 중 (${settledChunkCount}/${totalChunkCount})`,
+                        (isReanalysisTask ? 22 : 20) + Math.round((settledChunkCount / totalChunkCount) * 32)
+                    );
                     continue;
                 }
                 if (result.status === 'fulfilled' && result.value.content) {
                     const parsed = extractStructuredJson(result.value.content);
                     if (parsed) chunkSummaries.push(parsed);
+                    updateAnalysisDashboard(
+                        `대화 청크를 분석하는 중 (${settledChunkCount}/${totalChunkCount})`,
+                        (isReanalysisTask ? 22 : 20) + Math.round((settledChunkCount / totalChunkCount) * 32)
+                    );
                     continue;
                 }
                 failedChunkCount++;
+                updateAnalysisDashboard(
+                    `대화 청크를 분석하는 중 (${settledChunkCount}/${totalChunkCount})`,
+                    (isReanalysisTask ? 22 : 20) + Math.round((settledChunkCount / totalChunkCount) * 32)
+                );
             }
             if (chunkSummaries.length === 0) {
                 if (skippedChunkCount > 0 && failedChunkCount === 0) {
@@ -3343,6 +3425,10 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             }
 
             LMAI_GUI.toast(chunkSummaries.length > HIERARCHICAL_SYNTHESIS_MAX_BATCHES ? "초대형 대화 계층 합성 중..." : "최종 데이터 합성 중...");
+            updateAnalysisDashboard(
+                chunkSummaries.length > HIERARCHICAL_SYNTHESIS_MAX_BATCHES ? '분석 결과를 계층적으로 합성하는 중' : '분석 결과를 최종 합성하는 중',
+                isReanalysisTask ? 58 : 56
+            );
             return await synthesizeChunkSummariesHierarchically(chunkSummaries, taskLabel);
         };
 
@@ -3357,6 +3443,12 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 const msgs = buildAnalyzableMessages(chat);
                 if (msgs.length === 0) throw new Error("재분석할 대화 내역이 없습니다.");
 
+                if (typeof LIBRAActivityDashboard !== 'undefined') {
+                    LIBRAActivityDashboard.setStage('대화 구조를 다시 읽는 중', 18, {
+                        status: 'running',
+                        activeTask: '과거 대화 재분석'
+                    });
+                }
                 const candidateData = await analyzeConversationMessages(msgs, 'cold-reanalysis');
                 const currentData = buildCurrentStructuredSnapshot(lore);
                 let finalData = candidateData;
@@ -3383,6 +3475,12 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
 
                             if (hasAuxReviewer) {
                                 LMAI_GUI.toast(`보조 LLM이 재분석 후보를 검토 중... (${i + 1}/${reviewWindows.length})`);
+                                if (typeof LIBRAActivityDashboard !== 'undefined') {
+                                    LIBRAActivityDashboard.setStage(`재분석 후보를 검토하는 중 (${i + 1}/${reviewWindows.length})`, 62 + Math.round(((i + 1) / Math.max(1, reviewWindows.length)) * 10), {
+                                        status: 'running',
+                                        activeTask: '과거 대화 재분석'
+                                    });
+                                }
                                 const reviewResult = await runMaintenanceLLM(() =>
                                     LLMProvider.call(MemoryEngine.CONFIG, ReanalysisReviewPrompt, reviewInput, { maxTokens: 1400, profile: 'aux' })
                                 , `cold-reanalysis-review-${i + 1}`);
@@ -3404,6 +3502,12 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                                     reviewed ? buildCompactStructuredJson(stripReviewNotes(reviewed), REVIEW_DATA_MAX_CHARS) : '{}'
                                 ].join('\n');
                                 LMAI_GUI.toast(`메인 LLM이 창별 최종 판정 중... (${i + 1}/${reviewWindows.length})`);
+                                if (typeof LIBRAActivityDashboard !== 'undefined') {
+                                    LIBRAActivityDashboard.setStage(`창별 최종 판정을 정리하는 중 (${i + 1}/${reviewWindows.length})`, 72 + Math.round(((i + 1) / Math.max(1, reviewWindows.length)) * 8), {
+                                        status: 'running',
+                                        activeTask: '과거 대화 재분석'
+                                    });
+                                }
                                 const cycleArbiterResult = await runMaintenanceLLM(() =>
                                     LLMProvider.call(MemoryEngine.CONFIG, ReanalysisWindowArbiterPrompt, cycleArbiterInput, { maxTokens: 1600, profile: 'primary' })
                                 , `cold-reanalysis-window-arbiter-${i + 1}`);
@@ -3423,6 +3527,12 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
 
                         if (hasPrimaryArbiter) {
                             LMAI_GUI.toast(compressedReviewedResults.length > 1 ? "메인 LLM이 계층 압축된 재분석 결과를 판정 중..." : "메인 LLM이 최종 데이터를 판정 중...");
+                            if (typeof LIBRAActivityDashboard !== 'undefined') {
+                                LIBRAActivityDashboard.setStage('재분석 결과를 최종 판정하는 중', 84, {
+                                    status: 'running',
+                                    activeTask: '과거 대화 재분석'
+                                });
+                            }
                             const arbiterInput = [
                                 `[현재 구축된 데이터 / Current Structured Data]`,
                                 buildCompactStructuredJson(currentData, REVIEW_DATA_MAX_CHARS),
@@ -3448,6 +3558,12 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                     }
                 }
 
+                if (typeof LIBRAActivityDashboard !== 'undefined') {
+                    LIBRAActivityDashboard.setStage('검증된 재분석 결과를 병합하는 중', 92, {
+                        status: 'running',
+                        activeTask: '과거 대화 재분석'
+                    });
+                }
                 const verifiedMergedData = await verifyMergedStructuredKnowledge(currentData, finalData, 'cold-reanalysis-verify');
                 await mergeStructuredKnowledge(verifiedMergedData, {
                     updateNarrative: true,
@@ -3509,13 +3625,32 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 const msgs = buildAnalyzableMessages(chat);
                 
                 if (msgs.length === 0) throw new Error("분석할 대화 내역이 없습니다.");
+                if (typeof LIBRAActivityDashboard !== 'undefined') {
+                    LIBRAActivityDashboard.setStage('대화 구조를 읽고 분석 준비 중', 18, {
+                        status: 'running',
+                        activeTask: '과거 대화 분석'
+                    });
+                }
                 const analyzedData = await analyzeConversationMessages(msgs, 'cold-start');
+                const currentLore = MemoryEngine.getLorebook(char, chat) || [];
                 const currentData = buildCurrentStructuredSnapshot(currentLore);
+                if (typeof LIBRAActivityDashboard !== 'undefined') {
+                    LIBRAActivityDashboard.setStage('기존 구조 데이터와 비교 검증하는 중', 84, {
+                        status: 'running',
+                        activeTask: '과거 대화 분석'
+                    });
+                }
                 const finalData = await verifyMergedStructuredKnowledge(currentData, analyzedData, 'cold-start-verify');
 
                 if (MemoryEngine.CONFIG.debug) console.log("[LIBRA] Cold Start Synthesis Data:", finalData);
                 
                 // 데이터 반영 실행
+                if (typeof LIBRAActivityDashboard !== 'undefined') {
+                    LIBRAActivityDashboard.setStage('분석 결과를 LIBRA 데이터에 반영하는 중', 92, {
+                        status: 'running',
+                        activeTask: '과거 대화 분석'
+                    });
+                }
                 await applyFinalData(finalData);
 
             } catch (e) {
@@ -3561,9 +3696,15 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             "lmai_relation", "lmai_narrative", "lmai_story_author", "lmai_char_states",
             "lmai_world_states", "lmai_memory"
         ];
+        const _libraInheritedComments = [
+            ..._libraComments,
+            'lmai_user',
+            'lmai_hypa_v3_source',
+            'hypa_v3_import'
+        ];
 
         const _buildInheritedLore = (sourceLore, sceneSummary) => {
-            const inherited = sourceLore.filter(e => _libraComments.includes(e.comment) && e.key !== SCENE_CONTEXT_KEY);
+            const inherited = sourceLore.filter(e => _libraInheritedComments.includes(e.comment) && e.key !== SCENE_CONTEXT_KEY);
 
             const memoryEntries = inherited.filter(e => e.comment === 'lmai_memory');
             const structuralEntries = inherited.filter(e => e.comment !== 'lmai_memory');
@@ -3643,7 +3784,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                     const chatCount = nextChar.chats.length;
                     const newChat = {
                         message: [],
-                        note: '',
+                        note: String(sourceChat?.note || ''),
                         name: `Session ${chatCount + 1} (LIBRA)`,
                         localLore: inheritedLore,
                         fmIndex: -1,
@@ -3656,6 +3797,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                     await risuai.pluginStorage.setItem(BUFFER_KEY, JSON.stringify({
                         loreEntries: inheritedLore,
                         sceneSummary,
+                        sourceChatNote: String(sourceChat?.note || ''),
                         sourceChatId,
                         targetChatId: newChat.id,
                         createdAt: Date.now(),
@@ -3753,7 +3895,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 const libraComments = [
                     "lmai_world_graph", "lmai_world_node", "lmai_entity", 
                     "lmai_relation", "lmai_narrative", "lmai_story_author", "lmai_char_states", 
-                    "lmai_world_states"
+                    "lmai_world_states", "lmai_user", "lmai_hypa_v3_source", "hypa_v3_import"
                 ];
                 
                 let updatedLore = currentLore.filter(e => !libraComments.includes(e.comment) && e.key !== SCENE_CONTEXT_KEY);
@@ -3806,6 +3948,9 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 if (buffer.memoryState) {
                     MemoryState.gcCursor = buffer.memoryState.gcCursor || 0;
                     MemoryState.currentTurn = buffer.memoryState.currentTurn || 0;
+                }
+                if (chat && !String(chat.note || '').trim() && String(buffer?.sourceChatNote || '').trim()) {
+                    chat.note = String(buffer.sourceChatNote || '');
                 }
 
                 // 저장 및 엔진 재로드
@@ -3868,6 +4013,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                     const firstMsg = msgs_all[0];
                     if (firstMsg && firstMsg.role !== 'user' && !firstMsg.is_user) {
                         MemoryState.ignoredGreetingSignature = getMessageSignature(firstMsg);
+                        MemoryState.greetingIsolationChatId = currentChatId;
                         MemoryState.greetingIsolationRearmAvailable = true;
                         console.log('[LIBRA] Initial greeting identified and will be isolated');
                     }
@@ -9638,32 +9784,6 @@ You audit freshly extracted turn state and correct only clear mistakes.
             classification: {},
             __genreSourceText: `${userMsg || ''}\n${aiResponse || ''}`.trim()
         });
-        const normalizeWorldCustomRules = (custom) => {
-            if (Array.isArray(custom)) {
-                return Object.fromEntries(
-                    custom
-                        .map((value, index) => [`rule_${index + 1}`, String(value || '').trim()])
-                        .filter(([, value]) => value)
-                );
-            }
-            if (typeof custom === 'string') {
-                const trimmed = custom.trim();
-                return trimmed ? { rule_1: trimmed } : {};
-            }
-            if (custom && typeof custom === 'object') {
-                return Object.fromEntries(
-                    Object.entries(custom)
-                        .map(([key, value]) => {
-                            if (value == null) return [String(key || '').trim(), ''];
-                            if (typeof value === 'string') return [String(key || '').trim(), value.trim()];
-                            if (typeof value === 'number' || typeof value === 'boolean') return [String(key || '').trim(), String(value)];
-                            return [String(key || '').trim(), JSON.stringify(value)];
-                        })
-                        .filter(([key, value]) => key && value)
-                );
-            }
-            return {};
-        };
         const CLASSIFICATION_ALIASES = {
             modern_reality: '현대',
             fantasy: '판타지',
@@ -10128,7 +10248,7 @@ You audit freshly extracted turn state and correct only clear mistakes.
             return parts.join('\n');
         };
 
-        return { extractFromConversation, applyExtractions, formatStoredInfo, verifyTurnCorrections, hasCorrectionPayload };
+        return { extractFromConversation, applyExtractions, formatStoredInfo, verifyTurnCorrections, hasCorrectionPayload, inferWorldClassificationLabel };
     })();
 
     // ══════════════════════════════════════════════════════════════
@@ -11810,6 +11930,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             if (!char || !activeChat) throw new Error("채팅방을 찾을 수 없습니다.");
             const msgs = ColdStartManager.buildAnalyzableMessages(activeChat);
             if (msgs.length === 0) throw new Error("재분석할 대화 내역이 없습니다.");
+            LIBRAActivityDashboard.setStage('세계관 단서를 모으는 중', 28, {
+                status: 'reanalyzing-world',
+                activeTask: '세계관 재분석'
+            });
 
             const excerpt = buildConversationExcerpt(msgs, 12000);
             const transcript = excerpt || msgs.map(msg => {
@@ -11819,6 +11943,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             const analysisConfig = MemoryEngine.CONFIG;
             const complexAnalysis = ComplexWorldDetector.analyze(transcript, '');
             const storedInfo = EntityAwareProcessor.formatStoredInfo(8);
+            LIBRAActivityDashboard.setStage('세계관 구조를 다시 추출하는 중', 52, {
+                status: 'reanalyzing-world',
+                activeTask: '세계관 재분석'
+            });
             const extraction = await EntityAwareProcessor.extractFromConversation(
                 '[세계관 재분석 요청]\n현재 채팅 로그 전체를 기준으로 현재 세계 규칙만 다시 추출하라.',
                 transcript,
@@ -11832,7 +11960,15 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             if (Object.keys(worldPayload).length === 0 && !String(worldPayload.__genreSourceText || '').trim()) {
                 throw new Error("세계관 재분석 결과가 비어 있습니다.");
             }
+            const extractedSystems = worldPayload?.systems && typeof worldPayload.systems === 'object'
+                ? worldPayload.systems
+                : {};
+            const extractedClassification = String(worldPayload?.classification?.primary || '').toLowerCase();
 
+            LIBRAActivityDashboard.setStage('세계 규칙과 전역 특성을 반영하는 중', 78, {
+                status: 'reanalyzing-world',
+                activeTask: '세계관 재분석'
+            });
             await EntityAwareProcessor.applyExtractions({
                 entities: [],
                 relations: [],
@@ -11863,9 +11999,24 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 if (complexAnalysis.indicators.dreamWorld) profile.global.dreamWorld = true;
                 if (complexAnalysis.indicators.reincarnationPossession) profile.global.reincarnationPossession = true;
                 if (complexAnalysis.indicators.systemInterface) profile.global.systemInterface = true;
+                if (extractedSystems.leveling || extractedSystems.stats || extractedSystems.skills || extractedSystems.classes) {
+                    profile.global.systemInterface = true;
+                }
+                if (
+                    extractedClassification.includes('게임') ||
+                    extractedClassification.includes('hunter') ||
+                    extractedClassification.includes('헌터') ||
+                    extractedClassification.includes('이세계')
+                ) {
+                    profile.global.systemInterface = true;
+                }
             }
 
             syncWorldSnapshotFromRuntime();
+            LIBRAActivityDashboard.setStage('세계관 그래프를 저장하는 중', 92, {
+                status: 'reanalyzing-world',
+                activeTask: '세계관 재분석'
+            });
             await persistWorldGraphFromGui("🔄 세계관 재분석 완료", true);
         };
         const buildReplayableTurnPairs = (msgs) => {
@@ -11906,6 +12057,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             const config = MemoryEngine.CONFIG;
             const activeLore = MemoryEngine.getLorebook(char, activeChat) || lore;
             const existingMemoryEntries = MemoryEngine.getManagedEntries(activeLore);
+            const workingSimilarityEntries = [...existingMemoryEntries];
             const existingSnippets = existingMemoryEntries
                 .slice(-20)
                 .map(entry => Utils.getMemorySourceText(stripMeta(entry.content || '')))
@@ -11948,11 +12100,12 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                     const rawContent = Utils.getMemorySourceText(String(rawCandidate?.content || '').trim());
                     if (!rawContent || rawContent.length < 5) continue;
                     if (Utils.shouldExcludeStoredMemoryContent(rawContent)) continue;
+                    if (acceptedCandidates.some(item => Utils.getMemorySourceText(item?.content || '') === rawContent)) continue;
 
                     const similarExisting = await MemoryEngine.retrieveMemories(
                         rawContent,
                         currentTurnBase + i,
-                        existingMemoryEntries,
+                        workingSimilarityEntries,
                         {},
                         3
                     );
@@ -11985,8 +12138,17 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                     const content = Utils.getMemorySourceText(String(verified?.content || rawContent).trim());
                     const importance = Math.max(1, Math.min(10, parseInt(verified?.importance, 10) || parseInt(rawCandidate?.importance, 10) || 5));
                     if (!content || content.length < 5) continue;
+                    if (acceptedCandidates.some(item => Utils.getMemorySourceText(item?.content || '') === content)) continue;
                     acceptedCandidates.push({ content, importance });
                     existingSnippets.push(content);
+                    workingSimilarityEntries.push({
+                        key: `reanalysis_candidate_${TokenizerEngine.simpleHash(`${currentTurnBase + i}:${content}`)}`,
+                        comment: 'lmai_memory',
+                        content: `[META:${JSON.stringify({ t: currentTurnBase + i, ttl: -1, imp: importance, source: 'memory_reanalysis_candidate' })}]\n${content}`,
+                        mode: 'normal',
+                        insertorder: 100,
+                        alwaysActive: false
+                    });
                 }
 
                 if ((i + 1) % 3 === 0 || i === turnPairs.length - 1) {
@@ -12033,6 +12195,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             if (!char || !activeChat) throw new Error("채팅방을 찾을 수 없습니다.");
             const msgs = ColdStartManager.buildAnalyzableMessages(activeChat);
             if (msgs.length === 0) throw new Error("재분석할 대화 내역이 없습니다.");
+            LIBRAActivityDashboard.setStage('엔티티 단서를 수집하는 중', 28, {
+                status: 'reanalyzing-entity',
+                activeTask: '엔티티 재분석'
+            });
 
             const excerpt = buildConversationExcerpt(msgs, 12000);
             const transcript = excerpt || msgs.map(msg => {
@@ -12041,6 +12207,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             }).join('\n');
             const analysisConfig = MemoryEngine.CONFIG;
             const storedInfo = EntityAwareProcessor.formatStoredInfo(10);
+            LIBRAActivityDashboard.setStage('인물과 관계를 다시 추출하는 중', 54, {
+                status: 'reanalyzing-entity',
+                activeTask: '엔티티 재분석'
+            });
             const extraction = await EntityAwareProcessor.extractFromConversation(
                 '[엔티티/관계 재분석 요청]\n현재 채팅 로그 전체를 기준으로 엔티티와 관계를 다시 추출하라.',
                 transcript,
@@ -12053,6 +12223,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
 
             await loreLock.writeLock();
             try {
+                LIBRAActivityDashboard.setStage('엔티티와 관계를 반영하는 중', 82, {
+                    status: 'reanalyzing-entity',
+                    activeTask: '엔티티 재분석'
+                });
                 await EntityAwareProcessor.applyExtractions({
                     entities: extraction.entities || [],
                     relations: extraction.relations || [],
@@ -12075,6 +12249,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             if (!char || !activeChat) throw new Error("채팅방을 찾을 수 없습니다.");
             const msgs = ColdStartManager.buildAnalyzableMessages(activeChat);
             if (msgs.length === 0) throw new Error("재분석할 대화 내역이 없습니다.");
+            LIBRAActivityDashboard.setStage('대화 턴 쌍을 재구성하는 중', 28, {
+                status: 'reanalyzing-narrative',
+                activeTask: '내러티브 재분석'
+            });
 
             const turnPairs = buildReplayableTurnPairs(msgs);
             if (turnPairs.length === 0) throw new Error("내러티브 재구성에 필요한 턴 쌍이 없습니다.");
@@ -12097,11 +12275,25 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                     involvedEntities,
                     MemoryEngine.CONFIG
                 );
+                if ((i + 1) % 3 === 0 || i === turnPairs.length - 1) {
+                    LIBRAActivityDashboard.setStage(`스토리라인 턴을 재적용하는 중 (${i + 1}/${turnPairs.length})`, Math.min(78, 34 + Math.round(((i + 1) / Math.max(1, turnPairs.length)) * 42)), {
+                        status: 'reanalyzing-narrative',
+                        activeTask: '내러티브 재분석'
+                    });
+                }
             }
+            LIBRAActivityDashboard.setStage('스토리라인 요약을 다시 계산하는 중', 84, {
+                status: 'reanalyzing-narrative',
+                activeTask: '내러티브 재분석'
+            });
             await NarrativeTracker.summarizeIfNeeded(baseTurn + turnPairs.length, MemoryEngine.CONFIG);
 
             await loreLock.writeLock();
             try {
+                LIBRAActivityDashboard.setStage('내러티브 상태를 저장하는 중', 92, {
+                    status: 'reanalyzing-narrative',
+                    activeTask: '내러티브 재분석'
+                });
                 await NarrativeTracker.saveState(lore);
                 MemoryEngine.setLorebook(char, activeChat, lore);
                 await persistLoreToActiveChat(activeChat, lore, { saveCheckpoint: true });
@@ -12237,6 +12429,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 toast("❌ 캐릭터를 찾을 수 없습니다");
                 return;
             }
+            const activeChat = char?.chats?.[char.chatPage];
 
             LIBRAActivityDashboard.beginRequest({
                 requestType: 'hypa-import',
@@ -13285,7 +13478,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         overlay.querySelector('#btn-cold-start').onclick = async () => {
             if (!confirm("현재 채팅방의 과거 내역을 분석하여 메모리를 재구축하시겠습니까?")) return;
             await ColdStartManager.startAutoSummarization();
-            lore = MemoryEngine.getLorebook(char, activeChat) || lore;
+            lore = MemoryEngine.getLorebook(char, chat) || lore;
             syncGuiSnapshotsFromRuntime();
             renderEnts();
             renderNarrative();
@@ -13296,7 +13489,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         overlay.querySelector('#btn-cold-reanalyze').onclick = async () => {
             if (!confirm("현재 구축된 데이터와 새 재분석 결과를 원문 대화 기준으로 대조한 뒤, 더 적절한 구조 데이터로 재구축하시겠습니까?")) return;
             await ColdStartManager.reanalyzeHistoricalConversation();
-            lore = MemoryEngine.getLorebook(char, activeChat) || lore;
+            lore = MemoryEngine.getLorebook(char, chat) || lore;
             syncGuiSnapshotsFromRuntime();
             renderEnts();
             renderNarrative();
