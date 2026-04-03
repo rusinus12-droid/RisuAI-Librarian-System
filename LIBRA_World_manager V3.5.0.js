@@ -2680,6 +2680,8 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 relations: valid.flatMap(item => Array.isArray(item?.relations) ? item.relations : []),
                 world: {
                     tech: valid.map(item => item?.world?.tech).find(value => String(value || '').trim()) || '',
+                    summary: valid.map(item => item?.world?.summary).find(value => String(value || '').trim()) || '',
+                    description: valid.map(item => item?.world?.description).find(value => String(value || '').trim()) || '',
                     rules: valid.flatMap(item => Array.isArray(item?.world?.rules) ? item.world.rules : [])
                 }
             });
@@ -2812,6 +2814,8 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             relations: dedupeRelationsForMerge(finalData?.relations),
             world: {
                 tech: String(finalData?.world?.tech || '').trim(),
+                summary: String(finalData?.world?.summary || '').trim(),
+                description: String(finalData?.world?.description || '').trim(),
                 classification: finalData?.world?.classification && typeof finalData.world.classification === 'object'
                     ? safeClone(finalData.world.classification)
                     : {},
@@ -2836,6 +2840,8 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             const parts = [
                 String(sanitized?.narrative || '').trim(),
                 String(sanitized?.world?.tech || '').trim(),
+                String(sanitized?.world?.summary || '').trim(),
+                String(sanitized?.world?.description || '').trim(),
                 ...(Array.isArray(sanitized?.world?.rules) ? sanitized.world.rules : []),
                 ...((sanitized?.narrativeDetails?.storylines || []).flatMap(storyline => [
                     storyline?.name || '',
@@ -3168,6 +3174,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             const profile = HierarchicalWorldManager.getProfile();
             const rootNode = profile?.nodes?.get(profile?.rootId);
             const rootRules = rootNode?.rules || {};
+            const rootMeta = rootNode?.meta || {};
             return sanitizeStructuredKnowledge({
                 narrative,
                 narrativeDetails: {
@@ -3183,6 +3190,8 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 relations,
                 world: {
                     tech: rootRules?.exists?.technology || '',
+                    summary: String(rootMeta?.worldSummary || '').trim(),
+                    description: String(rootMeta?.worldMetadata?.description || '').trim(),
                     classification: { primary: inferWorldClassificationLabel(rootRules, '') },
                     exists: safeClone(rootRules?.exists || {}),
                     systems: safeClone(rootRules?.systems || {}),
@@ -3200,6 +3209,8 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             if (String(snapshot?.narrative || '').trim()) return true;
             if (Array.isArray(snapshot?.entities) && snapshot.entities.length > 0) return true;
             if (Array.isArray(snapshot?.relations) && snapshot.relations.length > 0) return true;
+            if (String(snapshot?.world?.summary || '').trim()) return true;
+            if (String(snapshot?.world?.description || '').trim()) return true;
             if (Array.isArray(snapshot?.world?.rules) && snapshot.world.rules.length > 0) return true;
             if (Array.isArray(snapshot?.narrativeDetails?.storylines) && snapshot.narrativeDetails.storylines.length > 0) return true;
             return false;
@@ -3793,7 +3804,17 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             }
         };
 
-        return { check, startAutoSummarization, reanalyzeHistoricalConversation, integrateImportedKnowledge, buildAnalyzableMessages };
+        return {
+            check,
+            startAutoSummarization,
+            reanalyzeHistoricalConversation,
+            integrateImportedKnowledge,
+            buildAnalyzableMessages,
+            prompts: {
+                memoryReanalysis: MemoryReanalysisPrompt,
+                memoryReanalysisVerification: MemoryReanalysisVerificationPrompt
+            }
+        };
     })();
 
     // ══════════════════════════════════════════════════════════════
@@ -5287,6 +5308,16 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
     const COPILOT_TOKEN_URL = 'https://api.github.com/copilot_internal/v2/token';
     const COPILOT_TOKEN_CACHE_KEY = 'copilot_tid_token';
     const COPILOT_TOKEN_EXPIRY_KEY = 'copilot_tid_token_expiry';
+    const resolveProviderBaseUrl = (provider, rawUrl, mode = 'llm') => {
+        const normalizedProvider = String(provider || 'openai').toLowerCase();
+        const normalizedRawUrl = String(rawUrl || '').trim();
+        if (normalizedRawUrl) return normalizedRawUrl;
+        if (normalizedProvider === 'openai') return 'https://api.openai.com';
+        if (normalizedProvider === 'openrouter') return 'https://openrouter.ai/api';
+        if (normalizedProvider === 'copilot' && mode === 'llm') return 'https://api.githubcopilot.com';
+        if (normalizedProvider === 'voyageai' && mode === 'embed') return 'https://api.voyageai.com';
+        return normalizedRawUrl;
+    };
 
     class OpenAIProvider extends BaseProvider {
         async _getCopilotBearerToken(rawToken) {
@@ -5332,7 +5363,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             this._checkKey(config.llm.key);
             const provider = (config.llm.provider || 'openai').toLowerCase();
             const endpointSuffix = provider === 'copilot' ? '/chat/completions' : '/v1/chat/completions';
-            const url = this._normalizeUrl(config.llm.url, endpointSuffix);
+            const url = this._normalizeUrl(resolveProviderBaseUrl(provider, config.llm.url, 'llm'), endpointSuffix);
             const authToken = provider === 'copilot'
                 ? await this._getCopilotBearerToken(config.llm.key)
                 : config.llm.key;
@@ -5382,7 +5413,8 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
 
         async getEmbedding(config, text) {
             this._checkKey(config.embed.key);
-            const url = this._normalizeUrl(config.embed.url, '/v1/embeddings');
+            const provider = (config.embed.provider || 'openai').toLowerCase();
+            const url = this._normalizeUrl(resolveProviderBaseUrl(provider, config.embed.url, 'embed'), '/v1/embeddings');
             const headers = { 
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${config.embed.key}`
@@ -5961,7 +5993,9 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                         `[LIBRA][LLM] fail | profile=${resolved.profile} | provider=${activeConfig.llm?.provider || 'openai'} | model=${activeConfig.llm?.model || ''} | url=${activeConfig.llm?.url || ''} | error=${e?.message || e}`
                     );
                 }
-                LIBRAActivityDashboard.fail(`LLM 호출 실패: ${e?.message || e}`);
+                if (!options.suppressDashboardFailure) {
+                    LIBRAActivityDashboard.fail(`LLM 호출 실패: ${e?.message || e}`);
+                }
                 console.error('[LIBRA] LLM Provider Error:', e?.message || e);
                 throw e;
             }
@@ -6084,7 +6118,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             },
             dimensional: null,
             connections: [],
-            meta: { created: Date.now(), updated: 0, source: 'default', notes: '' }
+            meta: { created: Date.now(), updated: 0, source: 'default', notes: '', worldSummary: '', classification: '', worldMetadata: {} }
         });
 
         const deepMerge = (target, source) => {
@@ -6262,7 +6296,15 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 rules: config.rules || { exists: {}, systems: {}, physics: {}, inheritance: { mode: 'extend', exceptions: [] } },
                 dimensional: config.dimensional || null,
                 connections: config.connections || [],
-                meta: { created: Date.now(), updated: 0, source: config.source || 'user', notes: config.notes || '' }
+                meta: {
+                    created: Date.now(),
+                    updated: 0,
+                    source: config.source || 'user',
+                    notes: config.notes || '',
+                    worldSummary: config.worldSummary || '',
+                    classification: config.classification || '',
+                    worldMetadata: config.worldMetadata && typeof config.worldMetadata === 'object' ? safeClone(config.worldMetadata) : {}
+                }
             };
 
             profile.nodes.set(id, node);
@@ -6283,6 +6325,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             if (updates.rules) node.rules = deepMerge(node.rules, updates.rules);
             if (updates.dimensional) node.dimensional = { ...node.dimensional, ...updates.dimensional };
             if (updates.connections) node.connections = [...node.connections, ...updates.connections];
+            if (updates.meta && typeof updates.meta === 'object') node.meta = deepMerge(node.meta || {}, updates.meta);
             node.meta.updated = Date.now();
 
             return { success: true, node };
@@ -6841,6 +6884,21 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
 
         const sanitizeEntityPersonalityFields = (personality) => {
             const source = personality && typeof personality === 'object' ? personality : {};
+            const sexualOrientationKeywords = [
+                '개방적', '보수적', '순결주의', '문란함', '금욕적',
+                '이성애', '동성애', '양성애', '무성애', '범성애',
+                'open-minded', 'conservative', 'chaste', 'prudish', 'sex-positive',
+                'heterosexual', 'straight', 'homosexual', 'gay', 'lesbian', 'bisexual', 'asexual', 'pansexual'
+            ];
+            const sexualPreferenceKeywords = [
+                's성향', 'm성향', '리버스', 'switch', 'dominant', 'submissive', 'dom', 'sub',
+                'sadist', 'masochist', 'voyeur', 'exhibitionist', '페티시', 'fetish', 'kink'
+            ];
+            const matchesKeyword = (value, keywords) => {
+                const text = String(value || '').trim().toLowerCase();
+                if (!text) return false;
+                return keywords.some(keyword => text === keyword || text.includes(keyword));
+            };
             const sexualOrientationPatterns = [
                 /sexual attitudes?\s*[:\-]\s*([^.;\n]+)/i,
                 /sexual orientation\s*[:\-]\s*([^.;\n]+)/i,
@@ -6879,7 +6937,16 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                     parsedPreferences.push(...extractedPrefs);
                 }
                 const cleanedTrait = stripLabeledFragments(trait, fragmentPatterns);
-                if (cleanedTrait) cleanedTraits.push(cleanedTrait);
+                if (!cleanedTrait) continue;
+                if (!parsedOrientation && matchesKeyword(cleanedTrait, sexualOrientationKeywords)) {
+                    parsedOrientation = cleanedTrait;
+                    continue;
+                }
+                if (matchesKeyword(cleanedTrait, sexualPreferenceKeywords)) {
+                    parsedPreferences.push(cleanedTrait);
+                    continue;
+                }
+                cleanedTraits.push(cleanedTrait);
             }
 
             return {
@@ -7431,7 +7498,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                         config,
                         'You compress a roleplay turn into one concrete narrative beat. Focus on what changed, was decided, revealed, or emotionally shifted. Respond in the same language as the content. Output plain text only, one sentence, no markdown, no quotes, max 160 characters.',
                         `User action:\n${sourceUser || '(none)'}\n\nAI response:\n${sourceAi}`,
-                        { maxTokens: 120, profile: 'aux' }
+                        { maxTokens: 120, profile: 'aux', suppressDashboardFailure: true }
                     )
                 , 'narrative-turn-brief');
                 return clipText(result?.content || heuristic, 180) || heuristic;
@@ -7707,7 +7774,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                             LLMProvider.call(config,
                                 'You are a narrative analyst. Summarize the following story events concisely. Identify the key plot points, character developments, and ongoing tensions. Respond in the same language as the content.\n\nOutput JSON: {"summary": "...", "keyPoints": ["..."], "ongoingTensions": ["..."], "context": "brief context for continuation"}',
                                 `Storyline: ${storyline.name}\nEntities: ${storyline.entities.join(', ')}\n\nRecent events:\n${turnTexts}`,
-                                { maxTokens: 500, profile: 'aux' }
+                                { maxTokens: 500, profile: 'aux', suppressDashboardFailure: true }
                             )
                         , `narrative-summary-${storyline.id || storyline.name || 'storyline'}`).then(result => {
                             if (!result.content) return false;
@@ -10191,18 +10258,110 @@ You audit freshly extracted turn state and correct only clear mistakes.
             custom: normalizeWorldCustomRules(world?.custom),
             content: JSON.stringify(world || {})
         });
+        const extractEntitiesFromPlainTextFallback = (text, lorebook = []) => {
+            const raw = String(text || '').trim();
+            if (!raw) return [];
+            const matches = raw.match(/[가-힣]{2,5}(?:\([A-Za-z][A-Za-z\s.'-]{1,40}\))?/g) || [];
+            const blocked = new Set(['사용자', '응답', '대화', '현재', '세계관', '관계', '인물', '정보', '요청', '분석', '재분석']);
+            const names = dedupeTextArray(matches.map(item => String(item || '').trim()).filter(item => item && !blocked.has(item)));
+            return names.slice(0, 12).map(name => ({
+                name: EntityManager.normalizeName(name, lorebook) || name,
+                appearance: { features: [], distinctiveMarks: [], clothing: [] },
+                personality: { traits: [], likes: [], dislikes: [], fears: [], sexualOrientation: '', sexualPreferences: [] },
+                background: { origin: '', occupation: '', history: [] },
+                status: { currentMood: '', currentLocation: '', healthStatus: '' }
+            }));
+        };
+        const extractRelationsFromPlainTextFallback = (text, entities) => {
+            const raw = String(text || '').trim();
+            const names = (Array.isArray(entities) ? entities : []).map(entity => String(entity?.name || '').trim()).filter(Boolean);
+            const relations = [];
+            const relationHints = [
+                { pattern: /(연인|애인|lover|romantic partner)/i, type: '연인' },
+                { pattern: /(친구|friend)/i, type: '친구' },
+                { pattern: /(가족|family|형제|자매|남매)/i, type: '가족' },
+                { pattern: /(동료|partner|teammate|동맹)/i, type: '동료' },
+                { pattern: /(적|enemy|원수|hostile)/i, type: '적대' }
+            ];
+            if (names.length < 2) return relations;
+            const relationType = relationHints.find(hint => hint.pattern.test(raw))?.type || '';
+            if (!relationType) return relations;
+            for (let i = 0; i < names.length; i++) {
+                for (let j = i + 1; j < names.length && relations.length < 6; j++) {
+                    relations.push({
+                        entityA: names[i],
+                        entityB: names[j],
+                        relationType,
+                        closenessDelta: relationType === '적대' ? -0.1 : 0.1,
+                        trustDelta: relationType === '적대' ? -0.1 : 0.05
+                    });
+                }
+            }
+            return relations;
+        };
+        const buildEntityExtractionFallback = (conversationText, lorebook = []) => {
+            const entities = extractEntitiesFromPlainTextFallback(conversationText, lorebook);
+            return {
+                success: entities.length > 0,
+                entities,
+                relations: extractRelationsFromPlainTextFallback(conversationText, entities),
+                world: buildGenreSourceWorldPayload('', conversationText),
+                conflicts: [],
+                fallback: true
+            };
+        };
 
         const extractFromConversation = async (userMsg, aiResponse, storedInfo, config) => {
             if (!config.useLLM) return { success: true, entities: [], relations: [], world: {}, conflicts: [] };
 
-            const systemInstruction = EntityExtractionPrompt.replace('{STORED_INFO}', storedInfo || '없음').replace('{CONVERSATION}', '');
-            const userContent = `[사용자]\n${userMsg}\n\n[응답]\n${aiResponse}`;
+            const normalizedStoredInfo = String(storedInfo || '').trim() || '없음';
+            const normalizedUserMsg = String(userMsg || '').trim();
+            const normalizedAiResponse = String(aiResponse || '').trim();
+            const safeConversation = normalizedAiResponse || normalizedUserMsg || '(no conversation provided)';
+            const fallbackEntityPrompt = [
+                'You extract entities, relations, and world information from roleplay conversation.',
+                'Return JSON only with keys: entities, relations, world, conflicts.'
+            ].join(' ');
+            const systemInstruction = String(EntityExtractionPrompt || fallbackEntityPrompt)
+                .replace('{STORED_INFO}', normalizedStoredInfo)
+                .replace('{CONVERSATION}', safeConversation);
+            const userParts = [];
+            if (normalizedUserMsg) userParts.push(`[사용자]\n${normalizedUserMsg}`);
+            if (normalizedAiResponse) userParts.push(`[응답]\n${normalizedAiResponse}`);
+            const userContent = userParts.join('\n\n') || `[대화]\n${safeConversation}`;
+            const tryParseEntityExtraction = (rawText) => {
+                const parsed = extractStructuredJson(Utils.stripLLMThinkingTags(rawText || ''));
+                if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+                return parsed;
+            };
 
             try {
-                const result = await LLMProvider.call(config, systemInstruction, userContent, { maxTokens: 1500 });
-                const content = Utils.stripLLMThinkingTags(result.content || '');
-                const parsed = extractStructuredJson(content);
-                if (!parsed || typeof parsed !== 'object') throw new Error('No valid JSON found');
+                const result = await LLMProvider.call(config, systemInstruction, userContent, { maxTokens: 1500, label: 'entity-extraction' });
+                let parsed = tryParseEntityExtraction(result?.content || '');
+                if (!parsed) {
+                    const repairSystem = [
+                        'You repair malformed extraction output into valid JSON.',
+                        'Return exactly one JSON object with keys: entities, relations, world, conflicts.',
+                        'Do not add commentary. Do not use markdown.'
+                    ].join(' ');
+                    const repairUser = [
+                        '[Original extraction output]',
+                        String(result?.content || '').trim() || '(empty)',
+                        '',
+                        '[Required JSON shape]',
+                        '{"entities":[],"relations":[],"world":{},"conflicts":[]}'
+                    ].join('\n');
+                    const repaired = await LLMProvider.call(config, repairSystem, repairUser, {
+                        maxTokens: 1500,
+                        label: 'entity-extraction-repair'
+                    });
+                    parsed = tryParseEntityExtraction(repaired?.content || '');
+                }
+                if (!parsed) {
+                    const fallback = buildEntityExtractionFallback(`${normalizedUserMsg}\n${normalizedAiResponse}`, []);
+                    if (fallback.success) return fallback;
+                    throw new Error('No valid JSON found');
+                }
                 const worldPayload = (parsed.world && typeof parsed.world === 'object') ? { ...parsed.world } : buildGenreSourceWorldPayload(userMsg, aiResponse);
                 worldPayload.__genreSourceText = `${userMsg || ''}\n${aiResponse || ''}`.trim();
                 return { success: true, entities: parsed.entities || [], relations: parsed.relations || [], world: worldPayload, conflicts: parsed.conflicts || [] };
@@ -10346,6 +10505,22 @@ You audit freshly extracted turn state and correct only clear mistakes.
                     if (currentNodeId) {
                         const currentNode = worldProfile.nodes.get(currentNodeId);
                         const worldRuleUpdate = normalizeWorldRuleUpdate(world);
+                        const rawWorldSummary = [
+                            String(world?.summary || '').trim(),
+                            String(world?.description || '').trim(),
+                            String(world?.tech || '').trim(),
+                            ...(Array.isArray(world?.rules) ? world.rules.map(item => String(item || '').trim()) : [])
+                        ].filter(Boolean).join('\n');
+                        const worldMetaPayload = {
+                            classification: String(world?.classification?.primary || inferWorldClassificationLabel(world, String(world?.__genreSourceText || '').trim())).trim(),
+                            worldSummary: truncateForLLM(rawWorldSummary, 1200, ' ... '),
+                            worldMetadata: {
+                                tech: String(world?.tech || '').trim(),
+                                description: String(world?.description || '').trim(),
+                                summary: String(world?.summary || '').trim(),
+                                sourceText: String(world?.__genreSourceText || '').trim()
+                            }
+                        };
                         const mode = String(config.worldAdjustmentMode || 'dynamic').toLowerCase();
                         const intent = WorldAdjustmentManager.analyzeUserIntent(_lastUserMessage || '', []);
                         const effectiveRules = HierarchicalWorldManager.getEffectiveRules(currentNodeId);
@@ -10362,7 +10537,7 @@ You audit freshly extracted turn state and correct only clear mistakes.
                             (mode === 'dynamic' && (intent.type === 'explicit_change' || intent.type === 'implicit_expand'));
 
                         if (allowUpdate) {
-                            HierarchicalWorldManager.updateNode(currentNodeId, { rules: worldRuleUpdate });
+                            HierarchicalWorldManager.updateNode(currentNodeId, { rules: worldRuleUpdate, meta: worldMetaPayload });
                             appliedChanges.push(`World rules updated (${mode})`);
                             if (conflictsDetected.length > 0) {
                                 conflicts.push(...conflictsDetected.map(c => ({ ...c, handledBy: mode })));
@@ -12141,6 +12316,41 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             }).join('\n');
             const analysisConfig = MemoryEngine.CONFIG;
             const complexAnalysis = ComplexWorldDetector.analyze(transcript, '');
+            const buildWorldFallbackFromTranscript = (sourceText) => {
+                const raw = String(sourceText || '').trim();
+                const lower = raw.toLowerCase();
+                const world = {
+                    classification: { primary: '' },
+                    exists: {},
+                    systems: {},
+                    __genreSourceText: raw
+                };
+                if (/(마법|마력|마나|오라|정령|주술|마도|magic|mana|arcane|aura|spell|sorcery)/i.test(raw)) {
+                    world.exists.magic = true;
+                    world.exists.supernatural = true;
+                }
+                if (/(기공|내공|심법|영력|선기|qi|ki|cultivation|meridian)/i.test(raw)) {
+                    world.exists.ki = true;
+                }
+                if (/(레벨|상태창|퀘스트|인벤토리|직업|클래스|스킬|스탯|특성|시스템|achievement|level|status window|quest|inventory|class|skill|stats|trait|system)/i.test(raw)) {
+                    world.systems.leveling = true;
+                    world.systems.skills = true;
+                    world.systems.stats = true;
+                    world.systems.classes = true;
+                }
+                if (/(사이버|전뇌|네온|메가코프|우주선|안드로이드|사이보그|cyber|megacorp|android|spaceship|starship|orbital|colony)/i.test(raw)) {
+                    world.exists.technology = 'future';
+                } else if (/(중세|왕국|영지|봉건|기사단|castle|kingdom|feudal|noble house)/i.test(raw)) {
+                    world.exists.technology = 'medieval';
+                } else if (/(현대|도시|학교|회사|smartphone|subway|apartment|office|campus|city)/i.test(raw)) {
+                    world.exists.technology = 'modern';
+                }
+                if (complexAnalysis.indicators.virtualReality || /\bvr\b|가상현실|simulation|inside the game/i.test(lower)) {
+                    world.exists.supernatural = world.exists.supernatural ?? false;
+                }
+                world.classification.primary = inferWorldClassificationLabel(world, raw);
+                return normalizeWorldRuleUpdate(world);
+            };
             const storedInfo = EntityAwareProcessor.formatStoredInfo(8);
             LIBRAActivityDashboard.setStage('세계관 구조를 다시 추출하는 중', 52, {
                 status: 'reanalyzing-world',
@@ -12153,9 +12363,11 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 analysisConfig
             );
 
-            const worldPayload = extraction?.world && typeof extraction.world === 'object'
-                ? extraction.world
-                : {};
+            const worldPayload = extraction?.success === false
+                ? buildWorldFallbackFromTranscript(transcript)
+                : (extraction?.world && typeof extraction.world === 'object'
+                    ? extraction.world
+                    : buildWorldFallbackFromTranscript(transcript));
             if (Object.keys(worldPayload).length === 0 && !String(worldPayload.__genreSourceText || '').trim()) {
                 throw new Error("세계관 재분석 결과가 비어 있습니다.");
             }
@@ -12248,6 +12460,11 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             if (!LLMProvider.isConfigured(MemoryEngine.CONFIG, 'primary') && !LLMProvider.isConfigured(MemoryEngine.CONFIG, 'aux')) {
                 throw new Error("메모리 재분석에 사용할 LLM이 구성되지 않았습니다.");
             }
+            const memoryReanalysisPrompt = ColdStartManager.prompts?.memoryReanalysis;
+            const memoryReanalysisVerificationPrompt = ColdStartManager.prompts?.memoryReanalysisVerification;
+            if (!memoryReanalysisPrompt || !memoryReanalysisVerificationPrompt) {
+                throw new Error("메모리 재분석 프롬프트를 불러오지 못했습니다.");
+            }
 
             const msgs = ColdStartManager.buildAnalyzableMessages(activeChat);
             if (msgs.length === 0) throw new Error("재분석할 대화 내역이 없습니다.");
@@ -12264,6 +12481,40 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 .map(entry => Utils.getMemorySourceText(stripMeta(entry.content || '')))
                 .filter(Boolean);
             const currentTurnBase = Math.max(1, Number(MemoryEngine.getCurrentTurn() || turnPairs.length));
+            const profile = LLMProvider.isConfigured(config, 'primary') ? 'primary' : 'aux';
+            const isLengthFailure = (error) => /finishReason=length|EMPTY_RESPONSE|returned no text content/i.test(String(error?.message || error || ''));
+            const callMemoryReanalysisLLM = async (systemPrompt, userPrompt, options = {}) => {
+                const {
+                    baseMaxTokens = 600,
+                    fallbackContent = '{"memories":[]}',
+                    label = 'memory-reanalysis'
+                } = options;
+                try {
+                    return await runMaintenanceLLM(() =>
+                        LLMProvider.call(
+                            config,
+                            systemPrompt,
+                            userPrompt,
+                            { maxTokens: baseMaxTokens, profile, label, suppressDashboardFailure: true }
+                        )
+                    , label);
+                } catch (error) {
+                    if (!isLengthFailure(error)) throw error;
+                }
+                try {
+                    return await runMaintenanceLLM(() =>
+                        LLMProvider.call(
+                            config,
+                            systemPrompt,
+                            userPrompt,
+                            { maxTokens: Math.max(180, Math.floor(baseMaxTokens * 0.55)), profile, label: `${label}-retry`, suppressDashboardFailure: true }
+                        )
+                    , `${label}-retry`);
+                } catch (retryError) {
+                    if (!isLengthFailure(retryError)) throw retryError;
+                    return { content: fallbackContent, usage: {}, fallback: true };
+                }
+            };
 
             const acceptedCandidates = [];
             let generatedCount = 0;
@@ -12285,14 +12536,15 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                     existingSnippets.length > 0 ? existingSnippets.slice(-8).map((item, idx) => `#${idx + 1} ${item}`).join('\n') : '(none)'
                 ].join('\n');
 
-                const candidateResult = await runMaintenanceLLM(() =>
-                    LLMProvider.call(
-                        config,
-                        MemoryReanalysisPrompt,
-                        candidateInput,
-                        { maxTokens: 900, profile: LLMProvider.isConfigured(config, 'primary') ? 'primary' : 'aux' }
-                    )
-                , `memory-reanalysis-candidate-${i + 1}`);
+                const candidateResult = await callMemoryReanalysisLLM(
+                    memoryReanalysisPrompt,
+                    candidateInput,
+                    {
+                        baseMaxTokens: 900,
+                        fallbackContent: '{"memories":[]}',
+                        label: `memory-reanalysis-candidate-${i + 1}`
+                    }
+                );
                 const parsed = extractStructuredJson(candidateResult?.content || '');
                 const candidates = Array.isArray(parsed?.memories) ? parsed.memories : [];
                 generatedCount += candidates.length;
@@ -12323,14 +12575,15 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                         `[Existing Similar Memories]`,
                         similarSnippets.length > 0 ? similarSnippets.map((item, idx) => `#${idx + 1} ${item}`).join('\n') : '(none)'
                     ].join('\n');
-                    const verifyResult = await runMaintenanceLLM(() =>
-                        LLMProvider.call(
-                            config,
-                            MemoryReanalysisVerificationPrompt,
-                            verifyInput,
-                            { maxTokens: 500, profile: LLMProvider.isConfigured(config, 'primary') ? 'primary' : 'aux' }
-                        )
-                    , `memory-reanalysis-verify-${i + 1}`);
+                    const verifyResult = await callMemoryReanalysisLLM(
+                        memoryReanalysisVerificationPrompt,
+                        verifyInput,
+                        {
+                            baseMaxTokens: 500,
+                            fallbackContent: '{"accept":false,"content":"","importance":5,"reason":"length fallback"}',
+                            label: `memory-reanalysis-verify-${i + 1}`
+                        }
+                    );
                     const verified = extractStructuredJson(verifyResult?.content || '');
                     if (!verified?.accept) {
                         verifiedOutCount += 1;
@@ -12418,6 +12671,9 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 storedInfo,
                 analysisConfig
             );
+            if (extraction?.success === false && extraction?.error) {
+                throw new Error(extraction.error);
+            }
             if ((!Array.isArray(extraction?.entities) || extraction.entities.length === 0) && (!Array.isArray(extraction?.relations) || extraction.relations.length === 0)) {
                 throw new Error("엔티티 재분석 결과가 비어 있습니다.");
             }
@@ -12940,8 +13196,23 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 : '<div class="empty">감지된 전역 세계 특성이 없습니다</div>';
             
             const lid = ap[ap.length - 1];
+            let currentNode = null;
+            if (lid) {
+                for (let i = 0; i < _WLD.nodes.length; i++) {
+                    if (_WLD.nodes[i][0] === lid) {
+                        currentNode = _WLD.nodes[i][1];
+                        break;
+                    }
+                }
+            }
             const effectiveRules = lid ? HierarchicalWorldManager.getEffectiveRules(lid) : null;
             if (effectiveRules) {
+                const nodeMeta = currentNode?.meta || {};
+                const worldSummaryLines = [];
+                if (nodeMeta.classification) worldSummaryLines.push(`분류: ${String(nodeMeta.classification)}`);
+                if (nodeMeta.worldSummary) worldSummaryLines.push(String(nodeMeta.worldSummary));
+                if (nodeMeta.worldMetadata?.description) worldSummaryLines.push(`설명: ${String(nodeMeta.worldMetadata.description)}`);
+                if (nodeMeta.worldMetadata?.tech) worldSummaryLines.push(`기술 메모: ${String(nodeMeta.worldMetadata.tech)}`);
                 const ex = effectiveRules.exists || {};
                 const sys = effectiveRules.systems || {};
                 const physics = effectiveRules.physics || {};
@@ -12956,6 +13227,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                             .filter(Boolean)
                         : [];
                 const lines = [];
+                if (worldSummaryLines.length > 0) {
+                    lines.push(...worldSummaryLines);
+                    lines.push('---');
+                }
 
                 const existingElements = [];
                 if (ex.magic) existingElements.push("마법");
