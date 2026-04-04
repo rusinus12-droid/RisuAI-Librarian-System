@@ -1109,6 +1109,12 @@
             .replace(/'/g, '&#39;');
         return options.map(option => `<option value="${escOption(option.value)}"${option.value === current ? ' selected' : ''}>${escOption(option.label)}</option>`).join('');
     };
+    const hasSpeechStyleValues = (speechStyle) => {
+        if (!speechStyle || typeof speechStyle !== 'object') return false;
+        const scalarKeys = ['defaultTone', 'honorificStyle', 'toSuperiors', 'toSubordinates', 'toPeers', 'toYounger'];
+        if (scalarKeys.some(key => String(speechStyle?.[key] || '').trim())) return true;
+        return Array.isArray(speechStyle?.notes) && speechStyle.notes.some(note => String(note || '').trim());
+    };
     const LIBRAActivityDashboard = (() => {
         const AUTO_CLOSE_MS = 5000;
         const baseState = () => ({
@@ -4480,7 +4486,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
     // [ENGINE] Missed Turn Recovery
     // ══════════════════════════════════════════════════════════════
     const TurnRecoveryEngine = (() => {
-        const POLL_MS = 4000;
+        const POLL_MS = 8000;
         const MAX_RECOVER_PER_PASS = 2;
         const MAX_SCAN_MESSAGES = 60;
         let inFlight = false;
@@ -4709,9 +4715,32 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             }
         };
 
+        const shouldDeferPollingRecovery = () => {
+            try {
+                if (typeof document !== 'undefined') {
+                    if (document.hidden) return true;
+                    if (document.querySelector('#lmai-overlay')) return true;
+                }
+            } catch (_) {}
+            return false;
+        };
+        const schedulePollingTick = () => {
+            if (!timerStarted || typeof setTimeout === 'undefined') return;
+            pollTimerId = setTimeout(async () => {
+                try {
+                    if (!shouldDeferPollingRecovery()) {
+                        await recoverIfNeeded('polling');
+                    }
+                } catch (_) {
+                } finally {
+                    schedulePollingTick();
+                }
+            }, POLL_MS);
+        };
         const stopPolling = () => {
-            if (pollTimerId != null && typeof clearInterval === 'function') {
-                clearInterval(pollTimerId);
+            if (pollTimerId != null) {
+                if (typeof clearTimeout === 'function') clearTimeout(pollTimerId);
+                if (typeof clearInterval === 'function') clearInterval(pollTimerId);
             }
             pollTimerId = null;
             timerStarted = false;
@@ -4720,7 +4749,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             }
         };
         const startPolling = () => {
-            if (typeof setInterval === 'undefined') return;
+            if (typeof setTimeout === 'undefined') return;
             const existingCleanup = typeof globalThis !== 'undefined' ? globalThis[LIBRA_TURN_RECOVERY_TIMER_CLEANUP_KEY] : null;
             if (typeof existingCleanup === 'function' && existingCleanup !== stopPolling) {
                 existingCleanup();
@@ -4728,9 +4757,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             if (timerStarted && pollTimerId != null) return;
             stopPolling();
             timerStarted = true;
-            pollTimerId = setInterval(() => {
-                recoverIfNeeded('polling').catch(() => {});
-            }, POLL_MS);
+            schedulePollingTick();
             if (typeof globalThis !== 'undefined') {
                 globalThis[LIBRA_TURN_RECOVERY_TIMER_CLEANUP_KEY] = stopPolling;
             }
@@ -12981,7 +13008,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
       <div class="fld"><label>성격 특성 (쉼표 구분)</label><input type="text" id="ae-trait" placeholder="친절한, 용감한"></div>
       <div class="fld"><label>성관념</label><input type="text" id="ae-sexual-orientation" placeholder="개방적, 보수적"></div>
       <div class="fld"><label>성적취향 (쉼표 구분)</label><input type="text" id="ae-sexual-preferences" placeholder="이성애, S성향"></div>
-      <details class="speech-dd">
+      <details class="speech-dd" data-auto-speech="off">
         <summary>말투 설정</summary>
         <div class="ef" style="margin-top:8px">
           <div class="fld"><label>기본 말투</label><select id="ae-speech-tone">${renderSpeechSelectOptions(LIBRA_SPEECH_TONE_OPTIONS, '')}</select></div>
@@ -14721,7 +14748,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                         <div class="fld"><label>성격 특성</label><input type="text" class="eP-val" data-idx="${i}" value="${escAttr(traits)}"></div>
                         <div class="fld"><label>성관념</label><input type="text" class="eSO-val" data-idx="${i}" value="${escAttr(sexualOrientation)}"></div>
                         <div class="fld"><label>성적취향</label><input type="text" class="eSP-val" data-idx="${i}" value="${escAttr(sexualPreferences)}"></div>
-                        <details class="speech-dd" style="margin-top:6px">
+                        <details class="speech-dd" data-entity-idx="${i}" data-auto-speech="${hasSpeechStyleValues(d.speechStyle) ? 'on' : 'off'}" style="margin-top:6px"${hasSpeechStyleValues(d.speechStyle) ? ' open' : ''}>
                             <summary>말투 설정</summary>
                             <div class="ef" style="margin-top:8px">
                                 <div class="fld"><label>기본 말투</label><select class="eST-val" data-idx="${i}">${renderSpeechSelectOptions(LIBRA_SPEECH_TONE_OPTIONS, speechTone)}</select></div>
@@ -15296,18 +15323,73 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                 }, 80);
             }
         };
+        const addEntitySpeechSelectors = ['#ae-speech-tone', '#ae-speech-honorific', '#ae-speech-superiors', '#ae-speech-subordinates', '#ae-speech-peers', '#ae-speech-younger', '#ae-speech-notes'];
+        const entitySpeechSelectorsByIndex = (idx) => [
+            `.eST-val[data-idx='${idx}']`,
+            `.eSH-val[data-idx='${idx}']`,
+            `.eSS-val[data-idx='${idx}']`,
+            `.eSD-val[data-idx='${idx}']`,
+            `.eSPe-val[data-idx='${idx}']`,
+            `.eSY-val[data-idx='${idx}']`,
+            `.eSN-val[data-idx='${idx}']`
+        ];
+        const syncAddEntitySpeechDetails = () => {
+            const detailsEl = overlay.querySelector('#aef .speech-dd');
+            if (!detailsEl) return;
+            const shouldOpen = addEntitySpeechSelectors.some(selector => String(overlay.querySelector(selector)?.value || '').trim() !== '');
+            detailsEl.open = shouldOpen;
+            detailsEl.dataset.autoSpeech = shouldOpen ? 'on' : 'off';
+        };
+        const syncEntitySpeechDetails = (idx) => {
+            if (idx == null || Number.isNaN(Number(idx))) return;
+            const detailsEl = overlay.querySelector(`.speech-dd[data-entity-idx='${idx}']`);
+            if (!detailsEl) return;
+            const shouldOpen = entitySpeechSelectorsByIndex(idx).some(selector => String(overlay.querySelector(selector)?.value || '').trim() !== '');
+            detailsEl.open = shouldOpen;
+            detailsEl.dataset.autoSpeech = shouldOpen ? 'on' : 'off';
+        };
 
         // 3. 자바스크립트로 직접 이벤트 연결 (Event Delegation)
         overlay.querySelector('#xbtn').onclick = () => {
             closeGuiOverlay();
         };
+        overlay.addEventListener('input', (e) => {
+            const target = e.target;
+            if (!(target instanceof Element)) return;
+            if (target.matches('#ae-speech-tone, #ae-speech-honorific, #ae-speech-superiors, #ae-speech-subordinates, #ae-speech-peers, #ae-speech-younger, #ae-speech-notes')) {
+                syncAddEntitySpeechDetails();
+                return;
+            }
+            const idx = target.getAttribute('data-idx');
+            if (idx != null && target.matches('.eST-val, .eSH-val, .eSS-val, .eSD-val, .eSPe-val, .eSY-val, .eSN-val')) {
+                syncEntitySpeechDetails(idx);
+            }
+        });
+        overlay.addEventListener('change', (e) => {
+            const target = e.target;
+            if (!(target instanceof Element)) return;
+            if (target.matches('#ae-speech-tone, #ae-speech-honorific, #ae-speech-superiors, #ae-speech-subordinates, #ae-speech-peers, #ae-speech-younger, #ae-speech-notes')) {
+                syncAddEntitySpeechDetails();
+                return;
+            }
+            const idx = target.getAttribute('data-idx');
+            if (idx != null && target.matches('.eST-val, .eSH-val, .eSS-val, .eSD-val, .eSPe-val, .eSY-val, .eSN-val')) {
+                syncEntitySpeechDetails(idx);
+            }
+        });
         overlay.querySelectorAll('.tb').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
         
         // 상단 툴바 및 폼 액션
         overlay.querySelector('#btn-toggle-add-mem').onclick = () => overlay.querySelector('#amf').classList.toggle('on');
         overlay.querySelector('#btn-cancel-mem').onclick = () => overlay.querySelector('#amf').classList.remove('on');
-        overlay.querySelector('#btn-toggle-add-ent').onclick = () => overlay.querySelector('#aef').classList.toggle('on');
-        overlay.querySelector('#btn-cancel-ent').onclick = () => overlay.querySelector('#aef').classList.remove('on');
+        overlay.querySelector('#btn-toggle-add-ent').onclick = () => {
+            overlay.querySelector('#aef').classList.toggle('on');
+            syncAddEntitySpeechDetails();
+        };
+        overlay.querySelector('#btn-cancel-ent').onclick = () => {
+            overlay.querySelector('#aef').classList.remove('on');
+            syncAddEntitySpeechDetails();
+        };
         overlay.querySelector('#btn-toggle-add-rel').onclick = () => overlay.querySelector('#arf').classList.toggle('on');
         overlay.querySelector('#btn-cancel-rel').onclick = () => overlay.querySelector('#arf').classList.remove('on');
 
@@ -15478,6 +15560,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             _ENT.push({ key: LibraLoreKeys.entityFromName(normalizedName), comment: "lmai_entity", content: JSON.stringify(d), mode: "normal", insertorder: 50, alwaysActive: false });
             overlay.querySelector("#ae-name").value = ""; overlay.querySelector("#ae-occ").value = ""; overlay.querySelector("#ae-loc").value = ""; overlay.querySelector("#ae-feat").value = ""; overlay.querySelector("#ae-trait").value = ""; overlay.querySelector("#ae-sexual-orientation").value = ""; overlay.querySelector("#ae-sexual-preferences").value = ""; overlay.querySelector("#ae-speech-tone").value = ""; overlay.querySelector("#ae-speech-honorific").value = ""; overlay.querySelector("#ae-speech-superiors").value = ""; overlay.querySelector("#ae-speech-subordinates").value = ""; overlay.querySelector("#ae-speech-peers").value = ""; overlay.querySelector("#ae-speech-younger").value = ""; overlay.querySelector("#ae-speech-notes").value = "";
             overlay.querySelector('#aef').classList.remove('on');
+            syncAddEntitySpeechDetails();
             renderEnts(); toast("✅ 인물 추가됨");
         };
 
@@ -15671,6 +15754,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             renderNarrative();
             renderWorld();
             filterMems();
+            syncAddEntitySpeechDetails();
             
             toast("✅ 캐시가 초기화되고 로어북 기준으로 동기화되었습니다.");
         };
@@ -15949,6 +16033,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         renderNarrative();
         renderWorld();
         loadSettings();
+        syncAddEntitySpeechDetails();
 
         await R.showContainer('fullscreen');
     };
