@@ -1,0 +1,116 @@
+<div style="max-width:960px;margin:0 auto;padding:30px 24px;background:linear-gradient(180deg,#0f131a 0%,#171d27 100%);border:1px solid #2d3748;border-radius:26px;box-shadow:0 24px 70px rgba(0,0,0,.32);color:#e9eef8;font-family:'Pretendard','SUIT','Apple SD Gothic Neo','Malgun Gothic',sans-serif;line-height:1.8;word-break:keep-all;">
+  <div style="display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;background:rgba(125,166,255,.12);border:1px solid rgba(125,166,255,.24);color:#a8c4ff;font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;">
+    Arca Release Note
+  </div>
+
+  <h1 style="margin:18px 0 10px;font-size:42px;line-height:1.14;letter-spacing:-0.04em;color:#fff;font-weight:950;">
+    LIBRA_World_manager V3.5.1.js
+  </h1>
+
+  <p style="margin:0 0 24px;color:#bcc8dc;font-size:15px;">
+    <strong style="color:#fff;">V3.5.0</strong>에서 <strong style="color:#fff;">V3.5.1</strong>로 올라오며 반영된
+    회귀 수정, LightBoard 호환성 보강, 추론 모델 대응 변경점을 한 번에 볼 수 있게 정리한 안내문입니다.
+  </p>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:0 0 26px;">
+    <div style="padding:15px 16px;border-radius:18px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);">
+      <div style="font-size:12px;color:#92a7cc;text-transform:uppercase;letter-spacing:.08em;">Release Focus</div>
+      <div style="margin-top:6px;font-size:18px;font-weight:900;color:#fff;">회귀 수정과 공존성 복원</div>
+    </div>
+    <div style="padding:15px 16px;border-radius:18px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);">
+      <div style="font-size:12px;color:#92a7cc;text-transform:uppercase;letter-spacing:.08em;">Core Theme</div>
+      <div style="margin-top:6px;font-size:18px;font-weight:900;color:#fff;">LightBoard 충돌 완화 + 추론 모델 대응</div>
+    </div>
+    <div style="padding:15px 16px;border-radius:18px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);">
+      <div style="font-size:12px;color:#92a7cc;text-transform:uppercase;letter-spacing:.08em;">User Impact</div>
+      <div style="margin-top:6px;font-size:18px;font-weight:900;color:#fff;">로어북 보존, 잘림 감소, 안정성 강화</div>
+    </div>
+  </div>
+
+  <div style="margin:0 0 18px;padding:18px;border-radius:20px;background:linear-gradient(180deg,rgba(122,162,247,.12),rgba(122,162,247,.04));border:1px solid rgba(122,162,247,.22);">
+    <div style="font-size:13px;font-weight:900;color:#a8c4ff;letter-spacing:.06em;text-transform:uppercase;">한 줄 요약</div>
+    <div style="margin-top:8px;font-size:16px;color:#eef4ff;">
+      V3.5.1은 <strong>외부 로어북 보존 회귀</strong>, <strong>Story Author RAG 축소 회귀</strong>,
+      <strong>LightBoard / XNAI 오인식</strong>, <strong>추론 모델 응답 잘림</strong> 같은 실사용 문제를
+      실제 사용 흐름 중심으로 보강한 안정화 업데이트입니다.
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:16px;">
+    <section style="padding:20px;border-radius:22px;background:#1a2130;border:1px solid #2b3549;">
+      <h2 style="margin:0 0 10px;font-size:24px;color:#fff;letter-spacing:-0.02em;">1. 로어북 보존 회귀 수정</h2>
+      <ul style="margin:0;padding-left:20px;color:#d9e2f0;">
+        <li><code>setLorebook</code>가 다시 <strong>전체 로어북을 통째로 교체하지 않고</strong>, <code>lmai_</code>가 아닌 외부 항목을 보존하도록 수정되었습니다.</li>
+        <li>NPC List 같은 다른 플러그인 로어북과 LIBRA 로어북이 같은 채팅에서 더 안전하게 공존합니다.</li>
+        <li>메모리/엔티티/관계/세계관을 갱신할 때 외부 로어북이 함께 지워지는 위험을 줄였습니다.</li>
+      </ul>
+    </section>
+
+    <section style="padding:20px;border-radius:22px;background:#1a2130;border:1px solid #2b3549;">
+      <h2 style="margin:0 0 10px;font-size:24px;color:#fff;letter-spacing:-0.02em;">2. Story Author 로어북 RAG 복원</h2>
+      <ul style="margin:0;padding-left:20px;color:#d9e2f0;">
+        <li>Story Author가 참조하는 일반 로어북 스니펫 수가 다시 <strong>3개 → 8개</strong>로 복원되었습니다.</li>
+        <li>설정/세계관/인물 메모가 많은 채팅에서 Story Author가 장면 방향을 더 넓게 참고할 수 있습니다.</li>
+        <li>장기 플롯이나 누적 설정이 많은 환경에서 보조 기획 품질이 다시 회복되는 쪽에 가깝습니다.</li>
+      </ul>
+    </section>
+
+    <section style="padding:20px;border-radius:22px;background:#1a2130;border:1px solid #2b3549;">
+      <h2 style="margin:0 0 10px;font-size:24px;color:#fff;letter-spacing:-0.02em;">3. LightBoard / XNAI 호환성 보강</h2>
+      <ul style="margin:0;padding-left:20px;color:#d9e2f0;">
+        <li><code>beforeRequest</code>는 최근 pending 패턴뿐 아니라 전체 메시지에서 <code>--- End of the log ---</code> + <code># Job Instruction</code> 조합도 감지합니다.</li>
+        <li><code>beforeRequest</code>와 <code>afterRequest</code> 사이에 <code>_lbRequestInFlight</code> 연동이 추가되어, LightBoard 응답에 LIBRA의 PendingTurn이 잘못 등록되는 상황을 줄였습니다.</li>
+        <li><code>recoverIfNeeded()</code>는 polling 경로뿐 아니라 <strong>모든 경로</strong>에서 LightBoard 활성 시 복구를 미룹니다.</li>
+        <li><code>syncMemory()</code>는 LightBoard 활동 중에는 삭제 동기화를 건너뛰고, 직후 첫 실행에서는 orphan tracker만 정리해 롤백 오인식을 줄입니다.</li>
+        <li><code>&lt;lb-xnai&gt;</code>, <code>&lt;lb-xnai-editing&gt;</code>, <code>lb-xnai-gen/</code> 같은 패턴 감지가 보강되어 이미지 편집/재생성 계열 요청과 일반 서사 턴 구분이 더 안정적입니다.</li>
+        <li>LightBoard active 상태에서는 로어 저장을 더 오래 대기하도록 조정되어, 백그라운드 저장과 <code>setChat/removeChat</code> 충돌 가능성을 낮췄습니다.</li>
+      </ul>
+    </section>
+
+    <section style="padding:20px;border-radius:22px;background:#1a2130;border:1px solid #2b3549;">
+      <h2 style="margin:0 0 10px;font-size:24px;color:#fff;letter-spacing:-0.02em;">4. 추론 모델 대응 설정 추가</h2>
+      <ul style="margin:0;padding-left:20px;color:#d9e2f0;">
+        <li>메인 LLM / 보조 LLM 설정에 <strong>Max Completion Tokens</strong> 항목이 추가되었습니다.</li>
+        <li>OpenAI 호환 추론 모델은 이제 <code>reasoning_effort</code> 사용 시 별도의 <code>max_completion_tokens</code>를 더 크게 줄 수 있어, <code>finish_reason=length</code>로 답변이 잘리는 상황을 줄입니다.</li>
+        <li>Gemini / Vertex thinking 모델도 추론 시 더 큰 출력 상한을 쓸 수 있도록 맞춰졌습니다.</li>
+        <li>Reasoning Budget Tokens는 계속 사용자가 직접 조절할 수 있고, 이제 추론 토큰 예산과 출력 토큰 상한을 분리해서 다룰 수 있습니다.</li>
+      </ul>
+    </section>
+
+    <section style="padding:20px;border-radius:22px;background:#1a2130;border:1px solid #2b3549;">
+      <h2 style="margin:0 0 10px;font-size:24px;color:#fff;letter-spacing:-0.02em;">5. 정리하면 달라진 체감</h2>
+      <ul style="margin:0;padding-left:20px;color:#d9e2f0;">
+        <li>다른 플러그인 로어북이 LIBRA 저장 때문에 사라질 가능성이 줄었습니다.</li>
+        <li>Story Author가 장기 설정을 더 잘 참고합니다.</li>
+        <li>LightBoard / XNAI 내부 턴을 일반 대화로 오인해 구조 데이터가 오염되는 상황이 줄었습니다.</li>
+        <li>추론 모델을 켰을 때 응답이 토큰 상한에 먼저 막혀 중간에 끊기는 문제가 완화되었습니다.</li>
+      </ul>
+    </section>
+  </div>
+
+  <div style="margin:22px 0 0;padding:18px;border-radius:20px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);">
+    <h2 style="margin:0 0 10px;font-size:22px;color:#fff;letter-spacing:-0.02em;">정리</h2>
+    <p style="margin:0;color:#d9e2f0;">
+      V3.5.1은 새 기능을 크게 늘린 버전이라기보다, <strong>이미 추가된 시스템들이 실제 환경에서 덜 부딪히게 만드는 안정화 패치</strong>에 가깝습니다.
+      특히 <strong>외부 로어북 공존</strong>, <strong>LightBoard 충돌 완화</strong>, <strong>추론 모델 출력 잘림 대응</strong> 쪽 체감이 가장 큽니다.
+    </p>
+  </div>
+
+  <div style="margin-top:24px;padding:20px;border-radius:22px;background:linear-gradient(180deg,rgba(139,92,246,.12),rgba(59,130,246,.08));border:1px solid rgba(139,92,246,.22);">
+    <div style="font-size:13px;font-weight:900;color:#cdbfff;letter-spacing:.06em;text-transform:uppercase;">Download</div>
+    <div style="margin-top:10px;color:#eef4ff;font-size:15px;">
+      아래 링크에 3.5.1 배포 파일을 연결해서 바로 사용할 수 있습니다.
+    </div>
+    <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;">
+      <a href="프로톤_다운로드_링크_여기에_삽입" target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;justify-content:center;padding:12px 18px;border-radius:14px;background:#6d4aff;color:#fff;text-decoration:none;font-weight:900;box-shadow:0 12px 30px rgba(109,74,255,.28);">
+        프로톤 다운로드
+      </a>
+      <a href="깃허브_다운로드_링크_여기에_삽입" target="_blank" rel="noopener noreferrer" style="display:inline-flex;align-items:center;justify-content:center;padding:12px 18px;border-radius:14px;background:#243041;color:#fff;text-decoration:none;font-weight:900;border:1px solid rgba(255,255,255,.12);">
+        GitHub 다운로드
+      </a>
+    </div>
+    <div style="margin-top:10px;font-size:13px;color:#b9c5da;">
+      링크만 교체해서 배포 글에 붙여 넣으면 됩니다.
+    </div>
+  </div>
+</div>

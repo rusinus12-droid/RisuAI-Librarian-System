@@ -2,7 +2,7 @@
 //@display-name LIBRA World Manager
 //@author rusinus12@gmail.com
 //@api 3.0
-//@version 3.5.0
+//@version 3.5.1
 
 (async () => {
     // ══════════════════════════════════════════════════════════════
@@ -619,7 +619,7 @@
         return { mode: 'body', host: document.body };
     };
     const LIGHTBOARD_PERSIST_DELAY_MS = 3000;
-    const LIGHTBOARD_PERSIST_MAX_RETRIES = 5;
+    const LIGHTBOARD_PERSIST_MAX_RETRIES = 100;
     const persistLoreToActiveChat = async (preferredChat, lore, opts = {}) => {
         if (!Array.isArray(lore)) return { ok: false, reason: 'invalid_lore' };
         const { saveCheckpoint = false, globalLore = undefined } = opts;
@@ -4206,6 +4206,22 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 return false;
             }
 
+            // LightBoard 활동 중이면 syncMemory 스킵
+            const lbActive = await isLightBoardActive();
+            if (lbActive) {
+                MemoryState._lbWasActive = true;
+                if (MemoryEngine.CONFIG.debug) {
+                    console.log('[LIBRA] syncMemory skipped: LightBoard active');
+                }
+                return false;
+            }
+
+            // LightBoard 활동 직후 첫 실행: ID 재매핑만 수행하고 롤백 스킵
+            const lbJustFinished = !!MemoryState._lbWasActive;
+            if (lbJustFinished) {
+                MemoryState._lbWasActive = false;
+            }
+
             const now = Date.now();
             const currentMsgIds = new Set();
             const comparableTextToMsgId = new Map();
@@ -4253,6 +4269,16 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 }
 
                 if ((now - transient.since) < TRANSIENT_MISSING_GRACE_MS) {
+                    continue;
+                }
+
+                // LightBoard 직후: 매칭 안 되는 ID는 롤백 대신 트래커에서 제거
+                if (lbJustFinished) {
+                    MemoryState.rollbackTracker.delete(id);
+                    MemoryState.transientMissing.delete(id);
+                    if (MemoryEngine.CONFIG.debug) {
+                        console.log(`[LIBRA] syncMemory post-LightBoard: orphaned tracker ${id} cleaned (not rolled back)`);
+                    }
                     continue;
                 }
 
@@ -4531,6 +4557,13 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             if (reason === 'polling' && isRefreshStabilizing()) {
                 if (MemoryEngine.CONFIG.debug) {
                     console.log('[LIBRA] polling recovery delayed during refresh stabilization window');
+                }
+                return 0;
+            }
+            // LightBoard 활동 중이면 복구 지연 (polling, beforeRequest 모두)
+            if (await isLightBoardActive()) {
+                if (MemoryEngine.CONFIG.debug) {
+                    console.log(`[LIBRA] ${reason} recovery delayed: LightBoard active`);
                 }
                 return 0;
             }
@@ -5206,6 +5239,9 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
     // ══════════════════════════════════════════════════════════════
     // [API] Providers
     // ══════════════════════════════════════════════════════════════
+    const DEFAULT_REASONING_BUDGET_TOKENS = 0;
+    const DEFAULT_MAX_COMPLETION_TOKENS = 16000;
+    const DEFAULT_AUX_MAX_COMPLETION_TOKENS = 12000;
     class BaseProvider {
         async callLLM(config, systemPrompt, userContent, options) { throw new Error('Not implemented'); }
         async getEmbedding(config, text) { throw new Error('Not implemented'); }
@@ -5391,6 +5427,8 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 modelName = COPILOT_MODEL_MAP[modelName];
             }
 
+            const requestedTokens = options.maxTokens || 1000;
+            const configuredMaxCompletionTokens = Math.max(0, parseInt(config.llm.maxCompletionTokens, 10) || 0);
             const body = {
                 model: modelName,
                 messages: [
@@ -5398,11 +5436,11 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                     { role: 'user', content: userContent }
                 ],
                 temperature: config.llm.temp || 0.3,
-                max_tokens: options.maxTokens || 1000
+                max_tokens: requestedTokens
             };
             if (config.llm.reasoningEffort && config.llm.reasoningEffort !== 'none') {
                 body.reasoning_effort = config.llm.reasoningEffort;
-                body.max_completion_tokens = options.maxTokens || 1000;
+                body.max_completion_tokens = Math.max(requestedTokens, configuredMaxCompletionTokens || DEFAULT_MAX_COMPLETION_TOKENS);
                 delete body.max_tokens;
             }
 
@@ -5443,6 +5481,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
                 temperature: config.llm.temp || 0.3
             };
             if ((config.llm.reasoningBudgetTokens || 0) >= 1024) {
+                body.max_tokens = Math.max(body.max_tokens, Math.max(0, parseInt(config.llm.maxCompletionTokens, 10) || 0) || DEFAULT_MAX_COMPLETION_TOKENS);
                 body.thinking = {
                     type: 'enabled',
                     budget_tokens: Math.max(1024, parseInt(config.llm.reasoningBudgetTokens, 10) || 1024)
@@ -5470,7 +5509,10 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             const url = baseUrl.includes(':generateContent') ? baseUrl : `${baseUrl}${modelPath}`;
             const isThinkingModel = /gemini-(3|2\.5)/i.test(model);
             const requestedTokens = options.maxTokens || 1000;
-            const maxOutputTokens = isThinkingModel ? Math.max(requestedTokens, 20000) : requestedTokens;
+            const configuredMaxCompletionTokens = Math.max(0, parseInt(config.llm.maxCompletionTokens, 10) || 0);
+            const maxOutputTokens = isThinkingModel
+                ? Math.max(requestedTokens, configuredMaxCompletionTokens || DEFAULT_MAX_COMPLETION_TOKENS)
+                : requestedTokens;
             const body = {
                 contents: [{ role: "user", parts: [{ text: userContent }] }],
                 generationConfig: {
@@ -5600,7 +5642,10 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             const accessToken = await VertexAIProvider._getAccessToken(config.llm.key);
             const isThinkingModel = /gemini-(3|2\.5)/i.test(model);
             const requestedTokens = options.maxTokens || 1000;
-            const maxOutputTokens = isThinkingModel ? Math.max(requestedTokens, 20000) : requestedTokens;
+            const configuredMaxCompletionTokens = Math.max(0, parseInt(config.llm.maxCompletionTokens, 10) || 0);
+            const maxOutputTokens = isThinkingModel
+                ? Math.max(requestedTokens, configuredMaxCompletionTokens || DEFAULT_MAX_COMPLETION_TOKENS)
+                : requestedTokens;
             const body = {
                 contents: [{ role: "user", parts: [{ text: userContent }] }],
                 generationConfig: { temperature: config.llm.temp || 0.3, maxOutputTokens: maxOutputTokens }
@@ -7942,7 +7987,7 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             const loreSnippets = MemoryEngine.CONFIG.useLorebookRAG
                 ? effectiveLore
                     .filter(e => !e.comment || !String(e.comment).startsWith('lmai_'))
-                    .slice(0, 3)
+                    .slice(0, 8)
                     .map(e => (e.content || '').slice(0, 180))
                 : [];
 
@@ -8845,8 +8890,8 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             directorMode: 'strong',
             sectionWorldInferenceEnabled: true,
             worldAdjustmentMode: 'dynamic',
-            llm: { provider: 'openai', url: '', key: '', model: 'gpt-4o-mini', temp: 0.3, timeout: 120000, reasoningEffort: 'none', reasoningBudgetTokens: 0 },
-            auxLlm: { enabled: false, provider: 'openai', url: '', key: '', model: 'gpt-4o-mini', temp: 0.2, timeout: 90000, reasoningEffort: 'none', reasoningBudgetTokens: 0 },
+            llm: { provider: 'openai', url: '', key: '', model: 'gpt-4o-mini', temp: 0.3, timeout: 120000, reasoningEffort: 'none', reasoningBudgetTokens: DEFAULT_REASONING_BUDGET_TOKENS, maxCompletionTokens: DEFAULT_MAX_COMPLETION_TOKENS },
+            auxLlm: { enabled: false, provider: 'openai', url: '', key: '', model: 'gpt-4o-mini', temp: 0.2, timeout: 90000, reasoningEffort: 'none', reasoningBudgetTokens: DEFAULT_REASONING_BUDGET_TOKENS, maxCompletionTokens: DEFAULT_AUX_MAX_COMPLETION_TOKENS },
             embed: { provider: 'openai', url: '', key: '', model: 'text-embedding-3-small', timeout: 120000 }
         };
 
@@ -9441,11 +9486,19 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
             isStandardLoreActive,
             prefilterStandardLore,
             setLorebook: (char, chat, data) => {
-                const next = Array.isArray(data) ? data.map(e => safeClone(e)) : [];
-                if (Array.isArray(chat?.localLore)) chat.localLore = next;
-                else if (Array.isArray(char?.lorebook)) char.lorebook = next;
-                else if (chat) chat.localLore = next;
-                else if (char) char.lorebook = next;
+                const target = Array.isArray(chat?.localLore) ? chat.localLore
+                    : Array.isArray(char?.lorebook) ? char.lorebook : null;
+                const externalEntries = Array.isArray(target)
+                    ? target.filter(e => !e.comment || !String(e.comment).startsWith('lmai_'))
+                    : [];
+                const libraEntries = (Array.isArray(data) ? data : [])
+                    .filter(e => e.comment && String(e.comment).startsWith('lmai_'))
+                    .map(e => safeClone(e));
+                const merged = [...externalEntries, ...libraEntries];
+                if (Array.isArray(chat?.localLore)) chat.localLore = merged;
+                else if (Array.isArray(char?.lorebook)) char.lorebook = merged;
+                else if (chat) chat.localLore = merged;
+                else if (char) char.lorebook = merged;
             },
             getManagedEntries: (lorebook) => (Array.isArray(lorebook) ? lorebook : []).filter(e => e.comment === 'lmai_memory'),
             getLastRetrievalDebug: () => lastRetrievalDebug ? safeClone(lastRetrievalDebug) : null,
@@ -10916,20 +10969,27 @@ if (typeof risuai !== 'undefined') {
         
         // Task 2-1: Skip if LightBoard/XNAI messages are found
         const shouldSkipLBXNAI = (msgs) => {
-            const recentMsgs = Array.isArray(msgs) ? msgs.slice(-2) : [];
-            return recentMsgs.some(m => {
+            const allMsgs = Array.isArray(msgs) ? msgs : [];
+            const recentMsgs = allMsgs.slice(-2);
+            const hasPending = recentMsgs.some(m => {
                 const text = String(m?.content || '');
                 return (
                     (/\[LBDATA START\].*lb-rerolling/is.test(text)) ||
                     (/\[LBDATA START\].*lb-interaction-identifier/is.test(text)) ||
                     (/\[LBDATA START\].*lb-pending/is.test(text)) ||
+                    (/<lb-xnai(?:[\s>\/]|$)/is.test(text)) ||
                     (/<lb-xnai-editing/is.test(text)) ||
                     (/lb-xnai-gen\//is.test(text))
                 );
             });
+            if (hasPending) return true;
+            const allText = allMsgs.map(m => String(m?.content || '')).join(' ');
+            if (allText.includes('--- End of the log ---') && allText.includes('# Job Instruction')) return true;
+            return false;
         };
 
         if (shouldSkipLBXNAI(safeMessages)) {
+            MemoryState._lbRequestInFlight = Date.now();
             if (MemoryEngine.CONFIG?.debug) console.log('[LIBRA] beforeRequest skipped: LightBoard/XNAI pattern detected');
             return safeMessages;
         }
@@ -11345,6 +11405,7 @@ if (typeof risuai !== 'undefined') {
             const isControlResponse = (
                 (/\[LBDATA START\].*(lb-rerolling|lb-interaction-identifier|lb-pending)/is.test(raw)) ||
                 (/<lb-process>/is.test(raw)) ||
+                (/<lb-xnai(?:[\s>\/]|$)/is.test(raw)) ||
                 (/lb-xnai-editing/is.test(raw))
             );
             // Illustration tags (<lb-xnai>) and NPC lists (<npc-list>) do NOT trigger a skip 
@@ -11354,6 +11415,13 @@ if (typeof risuai !== 'undefined') {
 
         if (shouldSkipAfterLBXNAI(content)) {
             if (MemoryEngine.CONFIG?.debug) console.log('[LIBRA] afterRequest skipped: LightBoard/XNAI pattern detected');
+            return content;
+        }
+
+        const lbRequestAge = Date.now() - (MemoryState._lbRequestInFlight || 0);
+        if (lbRequestAge < 60000 || await isLightBoardActive()) {
+            if (lbRequestAge < 60000) MemoryState._lbRequestInFlight = 0;
+            if (MemoryEngine.CONFIG?.debug) console.log('[LIBRA] afterRequest skipped: LightBoard active');
             return content;
         }
 
@@ -11522,7 +11590,8 @@ const updateConfigFromArgs = async () => {
         temp: getVal('temp', 'llm_temp', 'number', 'llm', 0.3),
         timeout: getVal('timeout', 'llm_timeout', 'number', 'llm', 120000),
         reasoningEffort: getVal('reasoningEffort', 'llm_reasoning_effort', 'string', 'llm', 'none'),
-        reasoningBudgetTokens: getVal('reasoningBudgetTokens', 'llm_reasoning_budget_tokens', 'number', 'llm', 0)
+        reasoningBudgetTokens: getVal('reasoningBudgetTokens', 'llm_reasoning_budget_tokens', 'number', 'llm', DEFAULT_REASONING_BUDGET_TOKENS),
+        maxCompletionTokens: getVal('maxCompletionTokens', 'llm_max_completion_tokens', 'number', 'llm', DEFAULT_MAX_COMPLETION_TOKENS)
     };
     cfg.auxLlm = {
         enabled: getVal('enabled', 'aux_llm_enabled', 'boolean', 'auxLlm', false),
@@ -11533,7 +11602,8 @@ const updateConfigFromArgs = async () => {
         temp: getVal('temp', 'aux_llm_temp', 'number', 'auxLlm', 0.2),
         timeout: getVal('timeout', 'aux_llm_timeout', 'number', 'auxLlm', 90000),
         reasoningEffort: getVal('reasoningEffort', 'aux_llm_reasoning_effort', 'string', 'auxLlm', 'none'),
-        reasoningBudgetTokens: getVal('reasoningBudgetTokens', 'aux_llm_reasoning_budget_tokens', 'number', 'auxLlm', 0)
+        reasoningBudgetTokens: getVal('reasoningBudgetTokens', 'aux_llm_reasoning_budget_tokens', 'number', 'auxLlm', DEFAULT_REASONING_BUDGET_TOKENS),
+        maxCompletionTokens: getVal('maxCompletionTokens', 'aux_llm_max_completion_tokens', 'number', 'auxLlm', DEFAULT_AUX_MAX_COMPLETION_TOKENS)
     };
     if (!cfg.auxLlm.enabled || !String(cfg.auxLlm.key || '').trim()) {
         cfg.auxLlm.enabled = false;
@@ -11560,7 +11630,7 @@ const updateConfigFromArgs = async () => {
 // Initialize
 (async () => {
     try {
-        console.log('[LIBRA] v3.5.0 Initializing...');
+        console.log('[LIBRA] v3.5.1 Initializing...');
         await updateConfigFromArgs();
 
         if (typeof risuai !== 'undefined') {
@@ -11599,7 +11669,7 @@ const updateConfigFromArgs = async () => {
         TurnRecoveryEngine.startPolling();
         const activeCfg = MemoryEngine.CONFIG;
         const embedStatus = (activeCfg.embed?.url && activeCfg.embed?.key) ? `${activeCfg.embed.provider}/${activeCfg.embed.model}` : 'disabled (fallback to Jaccard)';
-        console.log(`[LIBRA] v3.5.0 Ready. LLM=${activeCfg.useLLM} | Mode=${activeCfg.weightMode} | Embed=${embedStatus}`);
+        console.log(`[LIBRA] v3.5.1 Ready. LLM=${activeCfg.useLLM} | Mode=${activeCfg.weightMode} | Embed=${embedStatus}`);
         
         // Memory Carry-Over 및 Cold Start 감지 실행
         if (typeof risuai !== 'undefined') {
@@ -11737,7 +11807,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
     const GUI_BODY = `
 <div class="gui-wrap">
 <div class="hdr">
-  <h1>📚 LIBRA World Manager <span style="font-size:0.7rem; font-weight:normal; opacity:0.5;">v3.5.0</span></h1>
+  <h1>📚 LIBRA World Manager <span style="font-size:0.7rem; font-weight:normal; opacity:0.5;">v3.5.1</span></h1>
   <div class="tabs">
     <button class="tb on" data-tab="memory">📚 메모리</button>
     <button class="tb" data-tab="entity">👤 엔티티</button>
@@ -11855,7 +11925,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         <div class="fld"><label>Temperature</label><div class="rw"><input type="range" id="slt" min="0" max="1" step="0.1"><span id="sltv" class="rv">0.3</span></div></div>
         <div class="fld"><label>Timeout (ms)</label><input type="number" id="slto" placeholder="120000"></div>
         <div class="fld"><label>Reasoning Effort</label><select id="slre"><option value="none">사용 안 함</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div>
-        <div class="fld"><label>Reasoning Budget Tokens</label><input type="number" id="slrb" placeholder="0"></div>
+        <div class="fld"><label>Reasoning Budget Tokens</label><input type="number" id="slrb" placeholder="16384"></div>
+        <div class="fld"><label>Max Completion Tokens</label><input type="number" id="slmc" placeholder="16000"></div>
       </div>
       <div class="ss">
         <h3>⚡ 보조 LLM 설정</h3>
@@ -11867,7 +11938,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
         <div class="fld"><label>Temperature</label><div class="rw"><input type="range" id="saxt" min="0" max="1" step="0.1"><span id="saxtv" class="rv">0.2</span></div></div>
         <div class="fld"><label>Timeout (ms)</label><input type="number" id="saxto" placeholder="90000"></div>
         <div class="fld"><label>Reasoning Effort</label><select id="saxre"><option value="none">사용 안 함</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div>
-        <div class="fld"><label>Reasoning Budget Tokens</label><input type="number" id="saxrb" placeholder="0"></div>
+        <div class="fld"><label>Reasoning Budget Tokens</label><input type="number" id="saxrb" placeholder="16384"></div>
+        <div class="fld"><label>Max Completion Tokens</label><input type="number" id="saxmc" placeholder="12000"></div>
       </div>
       <div class="ss">
         <h3>🧠 Embedding 설정</h3>
@@ -13366,7 +13438,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                     temp: parseFloat(overlay.querySelector("#slt").value) || 0.3,
                     timeout: parseInt(overlay.querySelector("#slto").value) || 120000,
                     reasoningEffort: overlay.querySelector("#slre").value || "none",
-                    reasoningBudgetTokens: parseInt(overlay.querySelector("#slrb").value) || 0
+                    reasoningBudgetTokens: parseInt(overlay.querySelector("#slrb").value) || DEFAULT_REASONING_BUDGET_TOKENS,
+                    maxCompletionTokens: parseInt(overlay.querySelector("#slmc").value) || DEFAULT_MAX_COMPLETION_TOKENS
                 },
                 auxLlm: {
                     enabled: overlay.querySelector("#sax").checked,
@@ -13377,7 +13450,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
                     temp: parseFloat(overlay.querySelector("#saxt").value) || 0.2,
                     timeout: parseInt(overlay.querySelector("#saxto").value) || 90000,
                     reasoningEffort: overlay.querySelector("#saxre").value || "none",
-                    reasoningBudgetTokens: parseInt(overlay.querySelector("#saxrb").value) || 0
+                    reasoningBudgetTokens: parseInt(overlay.querySelector("#saxrb").value) || DEFAULT_REASONING_BUDGET_TOKENS,
+                    maxCompletionTokens: parseInt(overlay.querySelector("#saxmc").value) || DEFAULT_AUX_MAX_COMPLETION_TOKENS
                 },
                 embed: {
                     provider: overlay.querySelector("#sep").value,
@@ -13427,7 +13501,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             const t = overlay.querySelector("#slt"); t.value = (c.llm && c.llm.temp) || 0.3; overlay.querySelector("#sltv").textContent = t.value;
             overlay.querySelector("#slto").value = (c.llm && c.llm.timeout) || 120000;
             overlay.querySelector("#slre").value = (c.llm && c.llm.reasoningEffort) || "none";
-            overlay.querySelector("#slrb").value = (c.llm && c.llm.reasoningBudgetTokens) || 0;
+            overlay.querySelector("#slrb").value = (c.llm && c.llm.reasoningBudgetTokens) || DEFAULT_REASONING_BUDGET_TOKENS;
+            overlay.querySelector("#slmc").value = (c.llm && c.llm.maxCompletionTokens) || DEFAULT_MAX_COMPLETION_TOKENS;
             overlay.querySelector("#sax").checked = !!(c.auxLlm && c.auxLlm.enabled);
             overlay.querySelector("#saxp").value = (c.auxLlm && c.auxLlm.provider) || (c.llm && c.llm.provider) || "openai";
             overlay.querySelector("#saxu").value = (c.auxLlm && c.auxLlm.url) || "";
@@ -13436,7 +13511,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
             const at = overlay.querySelector("#saxt"); at.value = (c.auxLlm && c.auxLlm.temp) || 0.2; overlay.querySelector("#saxtv").textContent = at.value;
             overlay.querySelector("#saxto").value = (c.auxLlm && c.auxLlm.timeout) || 90000;
             overlay.querySelector("#saxre").value = (c.auxLlm && c.auxLlm.reasoningEffort) || "none";
-            overlay.querySelector("#saxrb").value = (c.auxLlm && c.auxLlm.reasoningBudgetTokens) || 0;
+            overlay.querySelector("#saxrb").value = (c.auxLlm && c.auxLlm.reasoningBudgetTokens) || DEFAULT_REASONING_BUDGET_TOKENS;
+            overlay.querySelector("#saxmc").value = (c.auxLlm && c.auxLlm.maxCompletionTokens) || DEFAULT_AUX_MAX_COMPLETION_TOKENS;
             overlay.querySelector("#scbs").checked = c.cbsEnabled !== false;
             overlay.querySelector("#slrag").checked = c.useLorebookRAG !== false;
             overlay.querySelector("#semo").checked = c.emotionEnabled !== false;
@@ -13772,7 +13848,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent2)}
 
         overlay.querySelector('#btn-reset-settings').onclick = () => {
             if (!confirm("모든 설정을 초기값으로 되돌리시겠습니까?")) return;
-            _CFG = { useLLM: true, cbsEnabled: true, useLorebookRAG: true, emotionEnabled: true, illustrationModuleCompatEnabled: false, nsfwEnabled: false, preventUserIgnoreEnabled: false, storyAuthorEnabled: true, storyAuthorMode: "proactive", directorEnabled: true, directorMode: "strong", sectionWorldInferenceEnabled: true, debug: false, memoryPreset: "general", maxLimit: MEMORY_PRESETS.general.maxLimit, threshold: MEMORY_PRESETS.general.threshold, simThreshold: MEMORY_PRESETS.general.simThreshold, gcBatchSize: MEMORY_PRESETS.general.gcBatchSize, coldStartScopePreset: "all", coldStartHistoryLimit: 0, weightMode: "auto", worldAdjustmentMode: "dynamic", llm: { provider: "openai", url: "", key: "", model: "gpt-4o-mini", temp: 0.3, timeout: 120000, reasoningEffort: "none", reasoningBudgetTokens: 0 }, auxLlm: { enabled: false, provider: "openai", url: "", key: "", model: "gpt-4o-mini", temp: 0.2, timeout: 90000, reasoningEffort: "none", reasoningBudgetTokens: 0 }, embed: { provider: "openai", url: "", key: "", model: "text-embedding-3-small", timeout: 120000 } };
+            _CFG = { useLLM: true, cbsEnabled: true, useLorebookRAG: true, emotionEnabled: true, illustrationModuleCompatEnabled: false, nsfwEnabled: false, preventUserIgnoreEnabled: false, storyAuthorEnabled: true, storyAuthorMode: "proactive", directorEnabled: true, directorMode: "strong", sectionWorldInferenceEnabled: true, debug: false, memoryPreset: "general", maxLimit: MEMORY_PRESETS.general.maxLimit, threshold: MEMORY_PRESETS.general.threshold, simThreshold: MEMORY_PRESETS.general.simThreshold, gcBatchSize: MEMORY_PRESETS.general.gcBatchSize, coldStartScopePreset: "all", coldStartHistoryLimit: 0, weightMode: "auto", worldAdjustmentMode: "dynamic", llm: { provider: "openai", url: "", key: "", model: "gpt-4o-mini", temp: 0.3, timeout: 120000, reasoningEffort: "none", reasoningBudgetTokens: DEFAULT_REASONING_BUDGET_TOKENS, maxCompletionTokens: DEFAULT_MAX_COMPLETION_TOKENS }, auxLlm: { enabled: false, provider: "openai", url: "", key: "", model: "gpt-4o-mini", temp: 0.2, timeout: 90000, reasoningEffort: "none", reasoningBudgetTokens: DEFAULT_REASONING_BUDGET_TOKENS, maxCompletionTokens: DEFAULT_AUX_MAX_COMPLETION_TOKENS }, embed: { provider: "openai", url: "", key: "", model: "text-embedding-3-small", timeout: 120000 } };
             loadSettings(); toast("🔄 설정 초기화됨");
         };
 
