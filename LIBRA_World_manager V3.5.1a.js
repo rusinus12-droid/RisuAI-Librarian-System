@@ -8094,27 +8094,40 @@ Return JSON only.${STRICT_JSON_OUTPUT_RULES}`;
         };
 
         const formatEntityForPrompt = (entity) => {
+            const safeEntity = entity && typeof entity === 'object' ? entity : {};
+            const appearance = (safeEntity.appearance && typeof safeEntity.appearance === 'object') ? safeEntity.appearance : {};
+            const personality = (safeEntity.personality && typeof safeEntity.personality === 'object') ? safeEntity.personality : {};
+            const speechStyle = (safeEntity.speechStyle && typeof safeEntity.speechStyle === 'object') ? safeEntity.speechStyle : {};
+            const background = (safeEntity.background && typeof safeEntity.background === 'object') ? safeEntity.background : {};
+            const status = (safeEntity.status && typeof safeEntity.status === 'object') ? safeEntity.status : {};
+            const features = Array.isArray(appearance.features) ? appearance.features : [];
+            const distinctiveMarks = Array.isArray(appearance.distinctiveMarks) ? appearance.distinctiveMarks : [];
+            const traits = Array.isArray(personality.traits) ? personality.traits : [];
+            const likes = Array.isArray(personality.likes) ? personality.likes : [];
+            const dislikes = Array.isArray(personality.dislikes) ? personality.dislikes : [];
+            const sexualPreferences = Array.isArray(personality.sexualPreferences) ? personality.sexualPreferences : [];
+            const speechNotes = Array.isArray(speechStyle.notes) ? speechStyle.notes : [];
             const parts = [];
-            parts.push(`【${entity.name}】`);
-            if (entity.appearance.features.length > 0 || entity.appearance.distinctiveMarks.length > 0) {
-                parts.push(`  외모/Appearance: ${[...entity.appearance.features, ...entity.appearance.distinctiveMarks].join(', ')}`);
+            parts.push(`【${safeEntity.name || '?'}】`);
+            if (features.length > 0 || distinctiveMarks.length > 0) {
+                parts.push(`  외모/Appearance: ${[...features, ...distinctiveMarks].join(', ')}`);
             }
-            if (entity.personality.traits.length > 0) parts.push(`  성격/Personality: ${entity.personality.traits.join(', ')}`);
-            if (entity.personality.sexualOrientation) parts.push(`  성관념/Sexual Orientation: ${entity.personality.sexualOrientation}`);
-            if (entity.personality.sexualPreferences?.length > 0) parts.push(`  성적취향/Sexual Preferences: ${entity.personality.sexualPreferences.join(', ')}`);
-            if (entity.speechStyle?.defaultTone) parts.push(`  말투 기본/Speech Tone: ${entity.speechStyle.defaultTone}`);
-            if (entity.speechStyle?.honorificStyle) parts.push(`  높임말 경향/Honorific Style: ${entity.speechStyle.honorificStyle}`);
-            if (entity.speechStyle?.toSuperiors) parts.push(`  윗사람에게/To Superiors: ${entity.speechStyle.toSuperiors}`);
-            if (entity.speechStyle?.toSubordinates) parts.push(`  아랫사람에게/To Subordinates: ${entity.speechStyle.toSubordinates}`);
-            if (entity.speechStyle?.toPeers) parts.push(`  동급·친구에게/To Peers: ${entity.speechStyle.toPeers}`);
-            if (entity.speechStyle?.toYounger) parts.push(`  동생·연하에게/To Younger: ${entity.speechStyle.toYounger}`);
-            if (entity.speechStyle?.notes?.length > 0) parts.push(`  말버릇/Speech Notes: ${entity.speechStyle.notes.join(', ')}`);
-            if (entity.personality.likes.length > 0) parts.push(`  좋아하는 것/Likes: ${entity.personality.likes.join(', ')}`);
-            if (entity.personality.dislikes.length > 0) parts.push(`  싫어하는 것/Dislikes: ${entity.personality.dislikes.join(', ')}`);
-            if (entity.background.origin) parts.push(`  출신/Origin: ${entity.background.origin}`);
-            if (entity.background.occupation) parts.push(`  직업/Occupation: ${entity.background.occupation}`);
-            if (entity.status.currentMood) parts.push(`  현재 기분/Current Mood: ${entity.status.currentMood}`);
-            if (entity.status.currentLocation) parts.push(`  현재 위치/Current Location: ${entity.status.currentLocation}`);
+            if (traits.length > 0) parts.push(`  성격/Personality: ${traits.join(', ')}`);
+            if (personality.sexualOrientation) parts.push(`  성관념/Sexual Orientation: ${personality.sexualOrientation}`);
+            if (sexualPreferences.length > 0) parts.push(`  성적취향/Sexual Preferences: ${sexualPreferences.join(', ')}`);
+            if (speechStyle.defaultTone) parts.push(`  말투 기본/Speech Tone: ${speechStyle.defaultTone}`);
+            if (speechStyle.honorificStyle) parts.push(`  높임말 경향/Honorific Style: ${speechStyle.honorificStyle}`);
+            if (speechStyle.toSuperiors) parts.push(`  윗사람에게/To Superiors: ${speechStyle.toSuperiors}`);
+            if (speechStyle.toSubordinates) parts.push(`  아랫사람에게/To Subordinates: ${speechStyle.toSubordinates}`);
+            if (speechStyle.toPeers) parts.push(`  동급·친구에게/To Peers: ${speechStyle.toPeers}`);
+            if (speechStyle.toYounger) parts.push(`  동생·연하에게/To Younger: ${speechStyle.toYounger}`);
+            if (speechNotes.length > 0) parts.push(`  말버릇/Speech Notes: ${speechNotes.join(', ')}`);
+            if (likes.length > 0) parts.push(`  좋아하는 것/Likes: ${likes.join(', ')}`);
+            if (dislikes.length > 0) parts.push(`  싫어하는 것/Dislikes: ${dislikes.join(', ')}`);
+            if (background.origin) parts.push(`  출신/Origin: ${background.origin}`);
+            if (background.occupation) parts.push(`  직업/Occupation: ${background.occupation}`);
+            if (status.currentMood) parts.push(`  현재 기분/Current Mood: ${status.currentMood}`);
+            if (status.currentLocation) parts.push(`  현재 위치/Current Location: ${status.currentLocation}`);
             return parts.join('\n');
         };
 
